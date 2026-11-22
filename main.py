@@ -1,6 +1,11 @@
 
 import os
 import logging
+import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import requests
 
 from telegram import Update
 from telegram.ext import (
@@ -13,9 +18,12 @@ from telegram.ext import (
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+API_KEY = os.getenv("API_FOOTBALL_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
-# JOURNALISATION
+API_BASE = "https://v3.football.api-sports.io"
+TIMEZONE = "Africa/Abidjan"
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -24,17 +32,88 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# API FOOTBALL
+def api_get(endpoint, params=None):
+    if not API_KEY:
+        raise RuntimeError("API_FOOTBALL_KEY absente dans Render.")
+
+    response = requests.get(
+        f"{API_BASE}/{endpoint}",
+        headers={"x-apisports-key": API_KEY},
+        params=params or {},
+        timeout=20,
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get("errors"):
+        raise RuntimeError(str(data["errors"]))
+
+    return data
+
+
+async def api_call(endpoint, params=None):
+    return await asyncio.to_thread(api_get, endpoint, params)
+
+
+def today():
+    return datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d")
+
+
+# CONNEXION API
+async def test_api():
+    data = await api_call("status")
+    return data
+
+
+# RECUPERATION DES MATCHS
+async def get_matches():
+    data = await api_call(
+        "fixtures",
+        {
+            "date": today(),
+            "timezone": TIMEZONE,
+        },
+    )
+    return data.get("response", [])
+
+
+def fixture_text(item):
+    fixture = item.get("fixture", {})
+    teams = item.get("teams", {})
+    league = item.get("league", {})
+
+    home = teams.get("home", {}).get("name", "Inconnu")
+    away = teams.get("away", {}).get("name", "Inconnu")
+    competition = league.get("name", "Compétition inconnue")
+
+    date = fixture.get("date", "")
+    status = fixture.get("status", {}).get("long", "")
+
+    return (
+        f"⚽ {home} - {away}\n"
+        f"🏆 {competition}\n"
+        f"🕒 {date}\n"
+        f"📌 {status}"
+    )
+
+
 # ACCUEIL
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = (
         "👑 Bienvenue sur ALEPH BET AI !\n\n"
-        "⚽ Ton assistant de pronostics sportifs.\n"
-        "🎯 Objectif : 2 meilleurs pronostics par analyse.\n"
-        "📊 Score exact uniquement si les données sont suffisantes.\n\n"
-        "Le moteur de données est en cours de configuration.\n"
-        "Aucun pronostic ne sera inventé.\n\n"
-        "Commandes disponibles : /start /aide /statut"
+        "⚽ Assistant intelligent de pronostics sportifs.\n"
+        "🎯 Objectif : 2 pistes de pronostics maximum.\n"
+        "📊 Aucun pourcentage ou score inventé.\n\n"
+        "Commandes :\n"
+        "/start - Accueil\n"
+        "/aide - Instructions\n"
+        "/statut - Connexions\n"
+        "/matchs - Matchs du jour\n"
+        "/pronostics - Analyse des matchs"
     )
+
     if update.message:
         await update.message.reply_text(message)
 
@@ -43,46 +122,213 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = (
         "📖 ALEPH BET AI\n\n"
-        "/start - Accueil\n"
-        "/aide - Aide\n"
-        "/statut - État du robot\n\n"
-        "Les analyses seront activées après "
-        "la connexion aux données sportives."
+        "/matchs : consulter les matchs du jour.\n"
+        "/pronostics : rechercher deux pistes.\n"
+        "/statut : vérifier les connexions.\n\n"
+        "Les pronostics ne garantissent aucun gain."
     )
+
     if update.message:
         await update.message.reply_text(message)
 
 
 # STATUT
 async def statut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = (
-        "🤖 ALEPH BET AI\n\n"
-        "Bot Telegram : connecté.\n"
-        "Serveur : actif.\n"
-        "Moteur de pronostics : en configuration.\n"
-        "Données des matchs : à connecter."
+    if not update.message:
+        return
+
+    await update.message.reply_text(
+        "🔍 Vérification des connexions..."
     )
-    if update.message:
-        await update.message.reply_text(message)
+
+    try:
+        data = await test_api()
+
+        account = data.get("response", [{}])[0]
+        requests_info = account.get("requests", {})
+
+        current = requests_info.get("current", "?")
+        limit = requests_info.get("limit_day", "?")
+
+        message = (
+            "🤖 ALEPH BET AI\n\n"
+            "Telegram : ✅ Connecté\n"
+            "Serveur : ✅ Actif\n"
+            "API-Football : ✅ Réponse reçue\n"
+            f"Requêtes utilisées : {current}\n"
+            f"Limite quotidienne : {limit}\n"
+            "Moteur : 🟡 Données en test"
+        )
+
+    except Exception as error:
+        logger.exception("Erreur API")
+        message = (
+            "🤖 ALEPH BET AI\n\n"
+            "Telegram : ✅ Connecté\n"
+            "Serveur : ✅ Actif\n"
+            "API-Football : ❌ Non vérifiée\n"
+            f"Erreur : {str(error)[:250]}"
+        )
+
+    await update.message.reply_text(message)
+
+
+# MATCHS DU JOUR
+async def matchs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    await update.message.reply_text(
+        "⚽ Recherche des matchs du jour..."
+    )
+
+    try:
+        fixtures = await get_matches()
+
+        if not fixtures:
+            await update.message.reply_text(
+                "Aucun match disponible aujourd'hui."
+            )
+            return
+
+        lines = [
+            f"⚽ MATCHS DU {today()}\n",
+        ]
+
+        for item in fixtures[:15]:
+            lines.append(fixture_text(item))
+
+        lines.append(
+            "\nAffichage limité aux 15 premiers matchs."
+        )
+
+        await update.message.reply_text(
+            "\n\n".join(lines)
+        )
+
+    except Exception as error:
+        logger.exception("Erreur matchs")
+        await update.message.reply_text(
+            f"❌ Impossible de récupérer les matchs : {str(error)[:250]}"
+        )
+
+
+# PRONOSTICS
+async def pronostics(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not update.message:
+        return
+
+    await update.message.reply_text(
+        "🧠 ALEPH BET AI analyse les données disponibles..."
+    )
+
+    try:
+        fixtures = await get_matches()
+
+        upcoming = [
+            item for item in fixtures
+            if item.get("fixture", {})
+            .get("status", {}).get("short") in ("NS", "TBD")
+        ]
+
+        if not upcoming:
+            await update.message.reply_text(
+                "Aucun match à venir disponible aujourd'hui."
+            )
+            return
+
+        candidates = []
+
+        # Limitation pour préserver le quota API
+        for item in upcoming[:5]:
+            fixture_id = item.get("fixture", {}).get("id")
+
+            if not fixture_id:
+                continue
+
+            data = await api_call(
+                "predictions",
+                {"fixture": fixture_id},
+            )
+
+            results = data.get("response", [])
+
+            if not results:
+                continue
+
+            prediction = results[0].get("predictions", {})
+            advice = prediction.get("advice")
+            winner = prediction.get("winner", {})
+            winner_name = winner.get("name")
+
+            if advice or winner_name:
+                candidates.append({
+                    "match": item,
+                    "advice": advice,
+                    "winner": winner_name,
+                })
+
+        if not candidates:
+            await update.message.reply_text(
+                "⚠️ Les matchs sont disponibles, "
+                "mais les données de prédiction sont insuffisantes."
+            )
+            return
+
+        lines = [
+            "👑 ALEPH BET AI — ANALYSE DU JOUR",
+            "",
+            "📊 Pistes issues des prédictions API-Football :",
+        ]
+
+        for index, candidate in enumerate(candidates[:2], 1):
+            lines.append(
+                f"\n🎯 PISTE {index}\n"
+                f"{fixture_text(candidate['match'])}\n"
+                f"🏆 Équipe indiquée : "
+                f"{candidate['winner'] or 'Non déterminée'}\n"
+                f"💡 Conseil API : "
+                f"{candidate['advice'] or 'Non disponible'}"
+            )
+
+        lines.append(
+            "\n⚠️ Ces pistes ne constituent pas "
+            "des probabilités garanties de réussite."
+        )
+
+        await update.message.reply_text(
+            "\n".join(lines)
+        )
+
+    except Exception as error:
+        logger.exception("Erreur pronostics")
+        await update.message.reply_text(
+            f"❌ Erreur d'analyse : {str(error)[:250]}"
+        )
 
 
 # DEMARRAGE
 def main():
 
     if not TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN est absent.")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN absent.")
 
     if not WEBHOOK_URL:
-        raise RuntimeError("WEBHOOK_URL est absent.")
+        raise RuntimeError("WEBHOOK_URL absent.")
 
     if not WEBHOOK_SECRET:
-        raise RuntimeError("WEBHOOK_SECRET est absent.")
+        raise RuntimeError("WEBHOOK_SECRET absent.")
 
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("aide", aide))
     app.add_handler(CommandHandler("statut", statut))
+    app.add_handler(CommandHandler("matchs", matchs))
+    app.add_handler(CommandHandler("pronostics", pronostics))
 
     logger.info("ALEPH BET AI démarre en mode webhook...")
 
