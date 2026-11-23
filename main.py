@@ -16,7 +16,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # Analyse prudente des matchs à venir + suivi des résultats
 # ============================================================
 
-VERSION = "3.4"
+VERSION = "3.5"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -100,16 +100,36 @@ def is_upcoming(fixture):
 def api_get(endpoint, params=None):
     if not API_KEY:
         raise RuntimeError("Clé API-Football absente.")
+
     response = requests.get(
         f"{API_BASE}/{endpoint}",
         headers={"x-apisports-key": API_KEY},
         params=params or {},
         timeout=REQUEST_TIMEOUT,
     )
-    response.raise_for_status()
-    data = response.json()
+
+    # Conserver le détail renvoyé par le serveur en cas d'erreur HTTP.
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        try:
+            body = response.json()
+            detail = body.get("errors") or body.get("message") or response.text[:300]
+        except ValueError:
+            detail = response.text[:300]
+        raise RuntimeError(
+            f"API-Football HTTP {response.status_code}: {str(detail)[:350]}"
+        ) from exc
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Réponse API invalide : JSON illisible.") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError("Réponse API invalide : format inattendu.")
     if data.get("errors"):
-        raise RuntimeError(str(data["errors"])[:250])
+        raise RuntimeError(f"Erreur API-Football : {str(data['errors'])[:350]}")
     return data
 
 
@@ -336,12 +356,11 @@ async def refresh_results():
     store = load_store()
     pending = [p for p in store["picks"] if p.get("result") == "pending"]
     if not pending:
-        return store, 0, 0, 0
+        return store, 0, 0, 0, []
 
-    # Les sélections conservent leur date locale au format JJ/MM/AAAA.
-    # L'API accepte déjà le filtre date utilisé par /matchs et /pronostics.
     today_local = now_local().date()
     dates_to_check = set()
+
     for pick in pending:
         raw_date = str(pick.get("date", "")).strip()
         parsed_date = None
@@ -357,6 +376,8 @@ async def refresh_results():
     updated = 0
     checked_dates = 0
     failed_dates = 0
+    errors = []
+
     for match_date in sorted(dates_to_check):
         try:
             data = await api_call(
@@ -369,18 +390,20 @@ async def refresh_results():
                 for f in fixtures
                 if f.get("fixture", {}).get("id") is not None
             }
+
             for pick in pending:
                 fixture = by_id.get(str(pick.get("fixture_id")))
                 if fixture and settle_pick(pick, fixture):
                     updated += 1
+
         except Exception as error:
             failed_dates += 1
-            logger.warning(
-                "Erreur actualisation bilan pour %s : %s", match_date, error
-            )
+            detail = f"{match_date} : {str(error)[:350]}"
+            errors.append(detail)
+            logger.exception("Erreur actualisation bilan pour %s", match_date)
 
     save_store(store)
-    return store, updated, checked_dates, failed_dates
+    return store, updated, checked_dates, failed_dates, errors
 
 
 # ---------------------- Moteur 3.4 -------------------------
@@ -685,7 +708,7 @@ async def pronostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("📊 Mise à jour des résultats en cours...")
-        store, updated, checked_dates, failed_dates = await refresh_results()
+        store, updated, checked_dates, failed_dates, errors = await refresh_results()
         picks = store["picks"]
         wins = sum(1 for p in picks if p.get("result") == "win")
         losses = sum(1 for p in picks if p.get("result") == "loss")
@@ -703,6 +726,11 @@ async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ En attente : {pending}",
             f"📚 Total enregistré : {len(picks)}",
         ]
+        if errors:
+            lines.extend(["", "⚠️ DÉTAIL DES ERREURS :"])
+            for error_detail in errors:
+                lines.append(f"• {error_detail}")
+
         if rate is not None:
             lines.append(f"📈 Réussite observée : {rate:.1f}% ({wins}/{settled})")
         else:
