@@ -1,934 +1,413 @@
 import os
-import json
 import logging
 import asyncio
-import time
-import threading
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from pathlib import Path
 
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ============================================================
-# ALEPH BET AI 3.8 PREMIUM
-# Appels API temporises, reprises 429, filtres prudents,
-# suivi des resultats et protection du quota quotidien.
+# ALEPH BET AI 4.0 MULTI-SPORTS
+# Football + Basketball + Hockey
+# Les API fournissent des données ; aucune certitude de pari.
 # ============================================================
 
-VERSION = "3.8 PREMIUM"
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-API_KEY = os.getenv("API_FOOTBALL_KEY")
+VERSION = "4.0 MULTI-SPORTS"
+TZ_NAME = "Africa/Abidjan"
+TZ = ZoneInfo(TZ_NAME)
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
-API_BASE = "https://v3.football.api-sports.io"
-TIMEZONE = "Africa/Abidjan"
-LOCAL_TZ = ZoneInfo(TIMEZONE)
+# Le compte API-Sports peut utiliser la même clé sur ses produits.
+# On permet toutefois des clés séparées si l'utilisateur en configure.
+FOOT_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
+BASKET_KEY = os.getenv("API_BASKETBALL_KEY", FOOT_KEY).strip()
+HOCKEY_KEY = os.getenv("API_HOCKEY_KEY", FOOT_KEY).strip()
 
-MIN_WIN_PERCENT = 65.0
-MIN_DOUBLE_CHANCE_PERCENT = 80.0
-MIN_1X2_SUM = 97.0
-MAX_1X2_SUM = 103.0
-MAX_ACCEPTED_PERCENT = 96.0
-
-MIN_COMPARISON_METRICS = 4
-MIN_QUALITY_SCORE = 62.0
-MAX_PREDICTION_CALLS = 8
-RESERVE_API_CALLS = 8
-MAX_DISPLAY_PICKS = 3
-ONE_PICK_PER_LEAGUE = True
-MIN_MINUTES_BEFORE_KICKOFF = 10
-
-# Une requete au plus toutes les 7 secondes environ.
-# Cela reduit fortement le risque de limite par minute.
-MIN_REQUEST_INTERVAL = 7.0
-MAX_429_RETRIES = 3
-RETRY_BASE_SECONDS = 20
-REQUEST_TIMEOUT = 25
-
-CACHE_DURATION = 1800
-DATA_FILE = Path(os.getenv("ALEPH_DATA_FILE", "aleph_bet_data.json"))
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
-
-analysis_cache = {"time": 0, "date": None, "result": None}
-_request_lock = threading.Lock()
-_last_request_at = 0.0
-
-
-# ------------------------- Horloge -------------------------
-
-def now_local():
-    return datetime.now(LOCAL_TZ)
-
-
-def today():
-    return now_local().date().isoformat()
-
-
-def parse_fixture_date(fixture):
-    raw = fixture.get("fixture", {}).get("date")
-    if not raw:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(LOCAL_TZ)
-    except (ValueError, TypeError):
-        return None
-
-
-def format_match_date(fixture):
-    value = parse_fixture_date(fixture)
-    return value.strftime("%d/%m/%Y") if value else "Date inconnue"
-
-
-def format_match_time(fixture):
-    value = parse_fixture_date(fixture)
-    return value.strftime("%H:%M") if value else "Heure inconnue"
-
-
-def is_upcoming(fixture):
-    status = fixture.get("fixture", {}).get("status", {}).get("short", "")
-    kickoff = parse_fixture_date(fixture)
-    return status == "NS" and kickoff is not None and kickoff > now_local()
-
-
-def is_safe_for_pick(fixture):
-    """Autorise une selection seulement si le coup d'envoi est a plus de 10 min."""
-    kickoff = parse_fixture_date(fixture)
-    return (
-        is_upcoming(fixture)
-        and kickoff is not None
-        and kickoff > now_local() + timedelta(minutes=MIN_MINUTES_BEFORE_KICKOFF)
-    )
-
-
-def pick_is_safe(pick):
-    """Revalide l'heure d'une selection, meme lorsqu'elle vient du cache."""
-    raw = pick.get("kickoff_at")
-    kickoff = None
-    if raw:
-        try:
-            kickoff = datetime.fromisoformat(str(raw))
-            if kickoff.tzinfo is None:
-                kickoff = kickoff.replace(tzinfo=LOCAL_TZ)
-            kickoff = kickoff.astimezone(LOCAL_TZ)
-        except (ValueError, TypeError):
-            kickoff = None
-    if kickoff is None:
-        try:
-            kickoff = datetime.strptime(
-                f"{pick.get('date')} {pick.get('time')}", "%d/%m/%Y %H:%M"
-            ).replace(tzinfo=LOCAL_TZ)
-        except (ValueError, TypeError):
-            return False
-    return kickoff > now_local() + timedelta(minutes=MIN_MINUTES_BEFORE_KICKOFF)
-
-
-def filter_safe_picks(picks):
-    return [pick for pick in picks if pick_is_safe(pick)]
-
-
-# --------------------- Couche API robuste ------------------
-
-def _paced_request():
-    """Serialise les appels et impose un intervalle minimum entre eux."""
-    global _last_request_at
-    with _request_lock:
-        elapsed = time.monotonic() - _last_request_at
-        wait_for = MIN_REQUEST_INTERVAL - elapsed
-        if wait_for > 0:
-            time.sleep(wait_for)
-        _last_request_at = time.monotonic()
-
-
-def api_get(endpoint, params=None):
-    if not API_KEY:
-        raise RuntimeError("Cle API-Football absente.")
-
-    url = f"{API_BASE}/{endpoint}"
-    last_error = None
-
-    for attempt in range(MAX_429_RETRIES + 1):
-        _paced_request()
-        try:
-            response = requests.get(
-                url,
-                headers={"x-apisports-key": API_KEY},
-                params=params or {},
-                timeout=REQUEST_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            last_error = RuntimeError(f"Erreur reseau API-Football: {str(exc)[:200]}")
-            if attempt < MAX_429_RETRIES:
-                time.sleep(min(5 * (attempt + 1), 15))
-                continue
-            raise last_error from exc
-
-        if response.status_code == 429:
-            detail = "Limite de requetes par minute atteinte."
-            try:
-                body = response.json()
-                detail = body.get("errors") or body.get("message") or detail
-            except ValueError:
-                pass
-            last_error = RuntimeError(
-                f"API-Football HTTP 429: {str(detail)[:220]}"
-            )
-            if attempt < MAX_429_RETRIES:
-                delay = RETRY_BASE_SECONDS * (attempt + 1)
-                logger.warning(
-                    "HTTP 429 sur %s. Nouvelle tentative dans %s secondes (%s/%s).",
-                    endpoint, delay, attempt + 1, MAX_429_RETRIES
-                )
-                time.sleep(delay)
-                continue
-            raise last_error
-
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            try:
-                body = response.json()
-                detail = body.get("errors") or body.get("message") or response.text[:250]
-            except ValueError:
-                detail = response.text[:250]
-            raise RuntimeError(
-                f"API-Football HTTP {response.status_code}: {str(detail)[:220]}"
-            ) from exc
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise RuntimeError("Reponse API-Football invalide : JSON illisible.") from exc
-
-        if data.get("errors"):
-            raise RuntimeError(f"Erreur API-Football : {str(data['errors'])[:220]}")
-        return data
-
-    raise last_error or RuntimeError("Echec API-Football inconnu.")
-
-
-async def api_call(endpoint, params=None):
-    return await asyncio.to_thread(api_get, endpoint, params)
-
-
-def get_response_list(data):
-    result = data.get("response", [])
-    if isinstance(result, list):
-        return result
-    if isinstance(result, dict):
-        return [result]
-    return []
-
-
-def get_status_info(data):
-    response = data.get("response", {})
-    if isinstance(response, list):
-        response = response[0] if response else {}
-    if not isinstance(response, dict):
-        return None, None
-    info = response.get("requests", {})
-    if not isinstance(info, dict):
-        return None, None
-    try:
-        current = int(info["current"]) if info.get("current") is not None else None
-        limit = int(info["limit_day"]) if info.get("limit_day") is not None else None
-        return current, limit
-    except (TypeError, ValueError):
-        return None, None
-
-
-# --------------------- Infos match -------------------------
-
-def get_fixture_name(fixture):
-    teams = fixture.get("teams", {})
-    home = teams.get("home", {}).get("name", "Domicile")
-    away = teams.get("away", {}).get("name", "Exterieur")
-    return f"{home} - {away}"
-
-
-def get_league_name(fixture):
-    league = fixture.get("league", {})
-    name = league.get("name", "Championnat inconnu")
-    country = league.get("country")
-    return f"{name} ({country})" if country else name
-
-
-def parse_percent(value):
-    if value is None:
-        return None
-    try:
-        number = float(str(value).replace("%", "").strip())
-        return number if 0 <= number <= 100 else None
-    except (ValueError, TypeError):
-        return None
-
-
-def spread_fixtures(fixtures, count):
-    if count <= 0:
-        return []
-    if len(fixtures) <= count:
-        return fixtures
-    if count == 1:
-        return [fixtures[0]]
-    indexes = [round(i * (len(fixtures) - 1) / (count - 1)) for i in range(count)]
-    output, seen = [], set()
-    for index in indexes:
-        if index not in seen:
-            output.append(fixtures[index])
-            seen.add(index)
-    return output
-
-
-# --------------- Comparaison premium API ------------------
-
-COMPARISON_LABELS = {
-    "form": "forme",
-    "att": "attaque",
-    "def": "defense",
-    "poisson_distribution": "Poisson",
-    "goals": "buts",
-    "h2h": "confrontations",
+APIS = {
+    "football": {
+        "base": "https://v3.football.api-sports.io",
+        "key": FOOT_KEY,
+        "header": "x-apisports-key",
+    },
+    "basketball": {
+        "base": "https://v1.basketball.api-sports.io",
+        "key": BASKET_KEY,
+        "header": "x-apisports-key",
+    },
+    "hockey": {
+        "base": "https://v1.hockey.api-sports.io",
+        "key": HOCKEY_KEY,
+        "header": "x-apisports-key",
+    },
 }
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("aleph-bet-ai")
 
-def comparison_quality(prediction_data, side):
-    comparison = prediction_data.get("comparison", {})
-    if not isinstance(comparison, dict):
-        return None, [], []
-
-    weights = {
-        "form": 1.25,
-        "att": 1.0,
-        "def": 1.0,
-        "poisson_distribution": 1.25,
-        "goals": 1.0,
-        "h2h": 0.50,
-    }
-    values, details = [], []
-    favorable = 0
-
-    for key, label in COMPARISON_LABELS.items():
-        block = comparison.get(key)
-        if not isinstance(block, dict):
-            continue
-        own = parse_percent(block.get(side))
-        opponent = parse_percent(block.get("away" if side == "home" else "home"))
-        if own is None or opponent is None:
-            continue
-
-        # Un ecart tres faible ne compte pas comme un avantage net.
-        if own >= opponent + 3:
-            favorable += 1
-        values.append((own, weights[key]))
-        details.append(f"{label}: {own:.0f}-{opponent:.0f}")
-
-    if len(values) < MIN_COMPARISON_METRICS:
-        return None, details, []
-
-    weighted_score = sum(v * w for v, w in values) / sum(w for _, w in values)
-    support_ratio = favorable / len(values)
-    quality = weighted_score * 0.75 + support_ratio * 100 * 0.25
-
-    # La defense doit etre presente et ne pas etre nettement defavorable.
-    defense = comparison.get("def")
-    if isinstance(defense, dict):
-        own_def = parse_percent(defense.get(side))
-        opp_def = parse_percent(defense.get("away" if side == "home" else "home"))
-        if own_def is not None and opp_def is not None and own_def + 10 < opp_def:
-            quality -= 8.0
-    else:
-        return None, details, []
-
-    return round(max(0.0, min(100.0, quality)), 1), details, values
+# Cache mémoire court pour éviter de répéter inutilement les mêmes appels.
+CACHE = {}
+CACHE_SECONDS = 180
 
 
-def extract_markets(prediction_data):
-    predictions = prediction_data.get("predictions", {})
-    if not isinstance(predictions, dict):
-        return {"markets": [], "reason": "Predictions absentes"}
-
-    percent = predictions.get("percent", {})
-    if not isinstance(percent, dict):
-        return {"markets": [], "reason": "Pourcentages absents"}
-
-    home = parse_percent(percent.get("home"))
-    draw = parse_percent(percent.get("draw"))
-    away = parse_percent(percent.get("away"))
-    if home is None or draw is None or away is None:
-        return {"markets": [], "reason": "Pourcentages 1N2 incomplets"}
-
-    total = home + draw + away
-    if not MIN_1X2_SUM <= total <= MAX_1X2_SUM:
-        return {"markets": [], "reason": f"Somme 1N2 incoherente ({total:.1f}%)"}
-
-    candidates = []
-    if MIN_WIN_PERCENT <= home <= MAX_ACCEPTED_PERCENT:
-        candidates.append(("1", "Victoire domicile", home, "home", "win"))
-    if MIN_WIN_PERCENT <= away <= MAX_ACCEPTED_PERCENT:
-        candidates.append(("2", "Victoire exterieure", away, "away", "win"))
-
-    for selection, value, side in (
-        ("1X", home + draw, "home"),
-        ("X2", away + draw, "away"),
-    ):
-        value = min(100.0, value)
-        if MIN_DOUBLE_CHANCE_PERCENT <= value <= MAX_ACCEPTED_PERCENT:
-            candidates.append((selection, "Double chance", value, side, "double"))
-
-    markets, rejected = [], []
-    for selection, label, estimate, side, market_type in candidates:
-        quality, details, _ = comparison_quality(prediction_data, side)
-        if quality is None:
-            rejected.append(f"{selection}: comparaison ou defense insuffisante")
-            continue
-        if quality < MIN_QUALITY_SCORE:
-            rejected.append(f"{selection}: indice qualite {quality:.1f}/100 trop faible")
-            continue
-        markets.append({
-            "market": label,
-            "selection": selection,
-            "percent": estimate,
-            "type": market_type,
-            "quality": quality,
-            "comparison_details": details,
-        })
-
-    markets.sort(key=lambda item: (item["quality"], item["percent"]), reverse=True)
-    return {
-        "markets": markets,
-        "reason": "; ".join(rejected[:3]) if not markets and rejected else None,
-        "home_percent": home,
-        "draw_percent": draw,
-        "away_percent": away,
-        "advice": predictions.get("advice"),
-        "under_over": predictions.get("under_over"),
-    }
+def now_local():
+    return datetime.now(TZ)
 
 
-# ---------------------- Suivi local ------------------------
+def date_local(offset=0):
+    return (now_local().date() + timedelta(days=offset)).isoformat()
 
-def load_store():
-    if not DATA_FILE.exists():
-        return {"picks": []}
+
+def parse_datetime(value):
+    if not value:
+        return None
     try:
-        with DATA_FILE.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        if not isinstance(data, dict) or not isinstance(data.get("picks"), list):
-            return {"picks": []}
-        return data
-    except (OSError, json.JSONDecodeError):
-        logger.warning("Fichier de suivi illisible : suivi vide.")
-        return {"picks": []}
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return dt.astimezone(TZ)
+    except (ValueError, TypeError):
+        return None
 
 
-def save_store(data):
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temp_file = DATA_FILE.with_suffix(".tmp")
-    with temp_file.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
-    temp_file.replace(DATA_FILE)
+def fmt_datetime(value):
+    dt = parse_datetime(value)
+    return dt.strftime("%d/%m/%Y à %H:%M") if dt else "Date non disponible"
 
 
-def register_picks(picks):
-    store = load_store()
-    existing = {
-        (str(item.get("fixture_id")), item.get("selection"), item.get("market_type"))
-        for item in store["picks"]
+def api_get(sport, endpoint, params=None):
+    cfg = APIS[sport]
+    if not cfg["key"]:
+        raise RuntimeError(f"Clé API {sport} absente dans Render.")
+    url = cfg["base"] + endpoint
+    headers = {cfg["header"]: cfg["key"]}
+    response = requests.get(url, headers=headers, params=params or {}, timeout=25)
+    if response.status_code == 429:
+        raise RuntimeError("Limite de requêtes API atteinte (429). Réessaie plus tard.")
+    response.raise_for_status()
+    payload = response.json()
+    errors = payload.get("errors")
+    if errors:
+        raise RuntimeError(f"Erreur API {sport}: {errors}")
+    return payload
+
+
+async def cached_api_get(sport, endpoint, params=None):
+    params = params or {}
+    cache_key = (sport, endpoint, tuple(sorted((str(k), str(v)) for k, v in params.items())))
+    saved = CACHE.get(cache_key)
+    if saved and (now_local().timestamp() - saved[0] < CACHE_SECONDS):
+        return saved[1]
+    result = await asyncio.to_thread(api_get, sport, endpoint, params)
+    CACHE[cache_key] = (now_local().timestamp(), result)
+    return result
+
+
+def response_list(payload):
+    value = payload.get("response", [])
+    return value if isinstance(value, list) else []
+
+
+def match_status(match):
+    status = match.get("fixture", {}).get("status", {})
+    if not status:
+        status = match.get("status", {})
+    return str(status.get("short", status.get("code", ""))).upper()
+
+
+def match_date(match):
+    fixture = match.get("fixture", {})
+    return fixture.get("date") or match.get("date") or match.get("start_time")
+
+
+def team_names(match):
+    teams = match.get("teams", {})
+    home = teams.get("home", {})
+    away = teams.get("away", {})
+    if isinstance(home, dict) and isinstance(away, dict):
+        return home.get("name", "Équipe inconnue"), away.get("name", "Équipe inconnue")
+    return "Équipe inconnue", "Équipe inconnue"
+
+
+def league_name(match):
+    league = match.get("league", {})
+    if isinstance(league, dict):
+        return league.get("name", "Compétition non précisée")
+    return "Compétition non précisée"
+
+
+def is_future_match(match):
+    dt = parse_datetime(match_date(match))
+    status = match_status(match)
+    # On exclut les rencontres commencées, terminées, reportées ou annulées.
+    blocked = {
+        "1H", "HT", "2H", "ET", "P", "LIVE", "INPLAY",
+        "Q1", "Q2", "Q3", "Q4", "OT", "P1", "P2", "P3",
+        "FT", "AET", "PEN", "POST", "CANC", "SUSP", "ABD",
+        "AWD", "WO", "BT", "INTR"
     }
-    added = 0
-    for pick in picks:
-        key = (str(pick["fixture_id"]), pick["selection"], pick["market_type"])
-        if key in existing:
-            continue
-        store["picks"].append({
-            "fixture_id": pick["fixture_id"],
-            "match": pick["match"],
-            "league": pick["league"],
-            "date": pick["date"],
-            "time": pick["time"],
-            "kickoff_at": pick.get("kickoff_at"),
-            "market": pick["market"],
-            "selection": pick["selection"],
-            "market_type": pick["market_type"],
-            "estimated_percent": pick["percent"],
-            "quality_score": pick["quality"],
-            "created_at": now_local().isoformat(),
-            "result": "pending",
-            "score": None,
-        })
-        existing.add(key)
-        added += 1
-    save_store(store)
-    return added
+    if not dt or dt <= now_local() or status in blocked:
+        return False
+    # Pour les API qui utilisent un statut explicite, seuls les statuts pré-match sont acceptés.
+    if status and status not in {"NS", "NOT STARTED", "SCHEDULED", "TBD"}:
+        return False
+    return True
 
 
-def settle_pick(pick, fixture):
-    status = fixture.get("fixture", {}).get("status", {}).get("short", "")
-    if status not in ("FT", "AET", "PEN"):
+def prediction_percent(prediction, key):
+    predictions = prediction.get("predictions", {})
+    percentages = predictions.get("percent", {})
+    raw = percentages.get(key)
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).replace("%", "").strip())
+    except (ValueError, TypeError):
         return None
 
-    score = fixture.get("score", {})
-    fulltime = score.get("fulltime") if isinstance(score, dict) else None
-    if isinstance(fulltime, dict):
-        home_goals, away_goals = fulltime.get("home"), fulltime.get("away")
-    else:
-        goals = fixture.get("goals", {})
-        home_goals, away_goals = goals.get("home"), goals.get("away")
 
-    if not isinstance(home_goals, int) or not isinstance(away_goals, int):
-        return None
-
-    selection = pick.get("selection")
-    if selection == "1":
-        outcome = home_goals > away_goals
-    elif selection == "2":
-        outcome = away_goals > home_goals
-    elif selection == "1X":
-        outcome = home_goals >= away_goals
-    elif selection == "X2":
-        outcome = away_goals >= home_goals
-    else:
-        return None
-
-    pick["score"] = f"{home_goals}-{away_goals}"
-    pick["result"] = "win" if outcome else "loss"
-    return pick["result"]
-
-
-async def refresh_results():
-    store = load_store()
-    pending = [p for p in store["picks"] if p.get("result") == "pending"]
-    if not pending:
-        return store, 0, 0, 0, []
-
-    today_local = now_local().date()
-    dates_to_check = set()
-    for pick in pending:
-        raw_date = str(pick.get("date", "")).strip()
-        parsed_date = None
-        for date_format in ("%d/%m/%Y", "%Y-%m-%d"):
-            try:
-                parsed_date = datetime.strptime(raw_date, date_format).date()
-                break
-            except ValueError:
-                continue
-        if parsed_date and parsed_date <= today_local:
-            dates_to_check.add(parsed_date.isoformat())
-
-    updated = checked_dates = failed_dates = 0
-    errors = []
-    for match_date in sorted(dates_to_check):
-        try:
-            data = await api_call("fixtures", {"date": match_date, "timezone": TIMEZONE})
-            fixtures = get_response_list(data)
-            by_id = {
-                str(f.get("fixture", {}).get("id")): f
-                for f in fixtures
-                if f.get("fixture", {}).get("id") is not None
-            }
-            checked_dates += 1
-            for pick in pending:
-                fixture = by_id.get(str(pick.get("fixture_id")))
-                if fixture:
-                    if settle_pick(pick, fixture):
-                        updated += 1
-        except Exception as error:
-            failed_dates += 1
-            errors.append(f"{match_date}: {str(error)[:200]}")
-            logger.warning("Erreur actualisation bilan %s: %s", match_date, error)
-
-    save_store(store)
-    return store, updated, checked_dates, failed_dates, errors
-
-
-# ---------------------- Moteur premium ----------------------
-
-async def analyze_all_matches():
-    current_date = today()
-    if (
-        analysis_cache["date"] == current_date
-        and analysis_cache["result"] is not None
-        and time.time() - analysis_cache["time"] < CACHE_DURATION
-    ):
-        cached_result = analysis_cache["result"]
-        cached_result["picks"] = filter_safe_picks(cached_result.get("picks", []))
-        cached_result["generated_at"] = now_local().strftime("%d/%m/%Y %H:%M:%S")
-        return cached_result
-
-    status_data = await api_call("status")
-    current, limit = get_status_info(status_data)
-    fixtures_data = await api_call(
-        "fixtures", {"date": current_date, "timezone": TIMEZONE}
-    )
-    fixtures = get_response_list(fixtures_data)
-
-    upcoming = [f for f in fixtures if is_upcoming(f)]
-    upcoming.sort(key=lambda f: f.get("fixture", {}).get("date", ""))
-
-    if isinstance(current, int) and isinstance(limit, int):
-        # Deux appels fixes (status + fixtures) et une reserve pour /bilan.
-        available = max(0, limit - current - RESERVE_API_CALLS - 2)
-        prediction_budget = min(MAX_PREDICTION_CALLS, available)
-    else:
-        prediction_budget = min(4, MAX_PREDICTION_CALLS)
-
-    safe_upcoming = [f for f in upcoming if is_safe_for_pick(f)]
-    chosen_fixtures = spread_fixtures(safe_upcoming, prediction_budget)
+def football_recommendation(prediction):
+    """N'affiche que les marchés dont le pourcentage est fourni par l'API."""
     candidates = []
-    attempts = analyzed = no_prediction = invalid_data = api_errors = 0
-    error_details = []
+    home, away = team_names(prediction)
+    p_home = prediction_percent(prediction, "home")
+    p_away = prediction_percent(prediction, "away")
+    p_draw = prediction_percent(prediction, "draw")
 
-    for fixture in chosen_fixtures:
-        if not is_safe_for_pick(fixture):
+    if p_home is not None and p_home >= 65:
+        candidates.append((p_home, f"Victoire {home}", "1"))
+    if p_away is not None and p_away >= 65:
+        candidates.append((p_away, f"Victoire {away}", "2"))
+    if p_home is not None and p_draw is not None and p_home + p_draw >= 80:
+        candidates.append((p_home + p_draw, f"Double chance 1X ({home} ou nul)", "1X"))
+    if p_away is not None and p_draw is not None and p_away + p_draw >= 80:
+        candidates.append((p_away + p_draw, f"Double chance X2 (nul ou {away})", "X2"))
+
+    if not candidates:
+        return None
+    # Pour éviter d'afficher plusieurs marchés du même match, on garde le plus élevé.
+    return max(candidates, key=lambda item: item[0])
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = [f"👑 ALEPH BET AI {VERSION}", f"🕒 Heure locale : {now_local():%d/%m/%Y %H:%M}", ""]
+    for sport, cfg in APIS.items():
+        if not cfg["key"]:
+            lines.append(f"⚪ {sport.capitalize()} : clé API non configurée")
             continue
-        fixture_id = fixture.get("fixture", {}).get("id")
+        try:
+            payload = await cached_api_get(sport, "/status")
+            response = payload.get("response", {})
+            account = response.get("account", {}) if isinstance(response, dict) else {}
+            subscription = response.get("subscription", {}) if isinstance(response, dict) else {}
+            requests_info = response.get("requests", {}) if isinstance(response, dict) else {}
+            used = requests_info.get("current")
+            limit = requests_info.get("limit")
+            quota = f" | Requêtes : {used}/{limit}" if used is not None and limit is not None else ""
+            lines.append(f"🟢 {sport.capitalize()} : API accessible{quota}")
+        except Exception as exc:
+            lines.append(f"🔴 {sport.capitalize()} : {str(exc)[:180]}")
+    lines += ["", "⚠️ Une connexion active ne garantit ni la disponibilité de tous les championnats ni la fiabilité d'un pari."]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def get_upcoming(sport, days=2):
+    endpoint = "/fixtures" if sport == "football" else "/games"
+    results = []
+    for offset in range(days):
+        payload = await cached_api_get(sport, endpoint, {"date": date_local(offset)})
+        results.extend(response_list(payload))
+    unique = {}
+    for item in results:
+        if is_future_match(item):
+            key = str(item.get("fixture", {}).get("id") or item.get("id") or (match_date(item), team_names(item)))
+            unique[key] = item
+    return sorted(unique.values(), key=lambda x: parse_datetime(match_date(x)) or now_local())
+
+
+async def sport_matches(update, sport, days=2, limit=12):
+    try:
+        matches = await get_upcoming(sport, days=days)
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Impossible de récupérer les matchs {sport} :\n{str(exc)[:350]}")
+        return
+
+    if not matches:
+        await update.message.reply_text(
+            f"📭 Aucun match {sport} à venir trouvé dans les {days} prochains jours.\n"
+            "Cela peut aussi signifier que la couverture de l'API est limitée."
+        )
+        return
+
+    title = f"⚽ FOOTBALL" if sport == "football" else ("🏀 BASKETBALL" if sport == "basketball" else "🏒 HOCKEY")
+    lines = [f"👑 ALEPH BET AI 4.0 — {title}", f"📅 Vérification : {now_local():%d/%m/%Y %H:%M}", ""]
+    for index, match in enumerate(matches[:limit], start=1):
+        home, away = team_names(match)
+        lines.append(
+            f"{index}. {home} — {away}\n"
+            f"🏆 {league_name(match)}\n"
+            f"🗓 {fmt_datetime(match_date(match))}"
+        )
+    lines += ["", "ℹ️ Liste de matchs à venir, pas une recommandation de mise."]
+    await update.message.reply_text("\n\n".join(lines))
+
+
+async def foot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        matches = await get_upcoming("football", days=2)
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Erreur Football : {str(exc)[:350]}")
+        return
+
+    if not matches:
+        await update.message.reply_text("📭 Aucun match de football à venir trouvé.")
+        return
+
+    lines = [
+        f"👑 ALEPH BET AI {VERSION} — PRÉ-ANALYSE FOOTBALL",
+        f"📅 {now_local():%d/%m/%Y %H:%M} (Côte d'Ivoire)",
+        ""
+    ]
+    attempts = 0
+    shown = 0
+    # Appels limités à 6 pour préserver le quota gratuit.
+    for match in matches[:6]:
+        fixture_id = match.get("fixture", {}).get("id")
         if not fixture_id:
             continue
         attempts += 1
         try:
-            data = await api_call("predictions", {"fixture": fixture_id})
-            responses = get_response_list(data)
-            if not responses:
-                no_prediction += 1
+            payload = await cached_api_get("football", "/predictions", {"fixture": fixture_id})
+            rows = response_list(payload)
+            if not rows:
                 continue
-            analyzed += 1
-            analysis = extract_markets(responses[0])
-            if analysis.get("reason") or not analysis["markets"]:
-                invalid_data += 1
+            row = rows[0]
+            recommendation = football_recommendation(row)
+            if not recommendation:
                 continue
-
-            best = analysis["markets"][0]
-            candidates.append({
-                "fixture_id": fixture_id,
-                "match": get_fixture_name(fixture),
-                "league": get_league_name(fixture),
-                "date": format_match_date(fixture),
-                "time": format_match_time(fixture),
-                "kickoff_at": parse_fixture_date(fixture).isoformat(),
-                "market": best["market"],
-                "selection": best["selection"],
-                "percent": best["percent"],
-                "quality": best["quality"],
-                "comparison_details": best["comparison_details"],
-                "market_type": best["type"],
-                "home_percent": analysis["home_percent"],
-                "draw_percent": analysis["draw_percent"],
-                "away_percent": analysis["away_percent"],
-                "advice": analysis.get("advice"),
-                "under_over": analysis.get("under_over"),
-            })
-        except Exception as error:
-            api_errors += 1
-            detail = f"Match {fixture_id}: {str(error)[:170]}"
-            if len(error_details) < 5:
-                error_details.append(detail)
-            logger.warning("Erreur prediction fixture %s: %s", fixture_id, error)
-
-    candidates.sort(key=lambda item: (item["quality"], item["percent"]), reverse=True)
-    selected, used_leagues = [], set()
-    fixture_by_id = {
-        str(f.get("fixture", {}).get("id")): f for f in upcoming
-    }
-    for candidate in candidates:
-        if len(selected) >= MAX_DISPLAY_PICKS:
-            break
-        original = fixture_by_id.get(str(candidate["fixture_id"]))
-        if not original or not is_safe_for_pick(original) or not pick_is_safe(candidate):
-            continue
-        if ONE_PICK_PER_LEAGUE and candidate["league"] in used_leagues:
-            continue
-        selected.append(candidate)
-        used_leagues.add(candidate["league"])
-
-    selected = filter_safe_picks(selected)
-    tracked = register_picks(selected) if selected else 0
-    result = {
-        "date": current_date,
-        "generated_at": now_local().strftime("%d/%m/%Y %H:%M:%S"),
-        "total": len(fixtures),
-        "upcoming": len(upcoming),
-        "attempts": attempts,
-        "analyzed": analyzed,
-        "no_prediction": no_prediction,
-        "invalid_data": invalid_data,
-        "api_errors": api_errors,
-        "error_details": error_details,
-        "prediction_budget": prediction_budget,
-        "picks": selected,
-        "tracked": tracked,
-    }
-    analysis_cache.update({"time": time.time(), "date": current_date, "result": result})
-    return result
-
-
-# ----------------------- Telegram -------------------------
-
-async def send_long_message(update, message):
-    while message:
-        if len(message) <= 3500:
-            await update.message.reply_text(message)
-            break
-        split_at = message.rfind("\n", 0, 3500)
-        if split_at < 1:
-            split_at = 3500
-        await update.message.reply_text(message[:split_at])
-        message = message[split_at:].lstrip()
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"ð BIENVENUE SUR ALEPH BET AI {VERSION} !\n\n"
-        "â½ Analyse multi-criteres des matchs a venir.\n"
-        "ð Forme, attaque, defense, Poisson et confrontations si disponibles.\n"
-        "ð¯ Maximum 3 selections, aucune selection forcee.\n"
-        "ð Dates completes et heures de Cote d'Ivoire.\n"
-        "ð Suivi des resultats reels avec /bilan.\n\n"
-        "COMMANDES : /matchs /pronostics /bilan /statut /aide\n\n"
-        "â ï¸ Les estimations et indices ne garantissent aucun gain."
-    )
-
-
-async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"ð¤ ALEPH BET AI {VERSION}\n\n"
-        "/start : Accueil\n/matchs : Matchs a venir aujourd'hui\n"
-        "/pronostics : Analyse premium\n/bilan : Suivi des resultats\n"
-        "/statut : Connexion et quota\n\n"
-        "MARCHES : 1, 2, 1X et X2.\n"
-        "Les marches Over/Under ne sont pas proposes sans probabilite fiable.\n\n"
-        "L'indice qualite mesure la coherence des comparaisons API ; "
-        "ce n'est pas une probabilite ni un taux historique."
-    )
-
-
-async def statut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = await api_call("status")
-        current, limit = get_status_info(data)
-        message = (
-            f"ð ALEPH BET AI {VERSION}\n"
-            "ð¢ Connexion API-Football : active\n"
-            f"â±ï¸ Intervalle API : environ {MIN_REQUEST_INTERVAL:.0f} secondes\n"
-        )
-        if current is not None and limit is not None:
-            message += (
-                f"ð Requetes utilisees : {current}\n"
-                f"ð¦ Limite quotidienne : {limit}\n"
-                f"ð Restantes : {max(0, limit - current)}\n"
-            )
-        await update.message.reply_text(message)
-    except Exception as error:
-        logger.exception("Erreur statut")
-        await update.message.reply_text("ð´ Connexion API impossible.\n" + str(error)[:250])
-
-
-async def matchs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = await api_call("fixtures", {"date": today(), "timezone": TIMEZONE})
-        fixtures = [f for f in get_response_list(data) if is_upcoming(f)]
-        fixtures.sort(key=lambda f: f.get("fixture", {}).get("date", ""))
-        if not fixtures:
-            await update.message.reply_text("â½ Aucun match a venir aujourd'hui.")
-            return
-        lines = [
-            f"â½ MATCHS A VENIR â {now_local().strftime('%d/%m/%Y')}",
-            f"Total : {len(fixtures)}", "",
-        ]
-        for fixture in fixtures[:30]:
-            lines.extend([
-                f"ð {format_match_date(fixture)}",
-                f"ð {format_match_time(fixture)} (Cote d'Ivoire)",
-                f"ð {get_league_name(fixture)}",
-                f"â½ {get_fixture_name(fixture)}", "",
-            ])
-        await send_long_message(update, "\n".join(lines))
-    except Exception as error:
-        logger.exception("Erreur matchs")
-        await update.message.reply_text("â Erreur recuperation matchs : " + str(error)[:250])
-
-
-async def pronostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"ð ALEPH BET AI {VERSION}\n"
-        "ð Analyse premium des matchs a venir...\n"
-        "â±ï¸ Requetes API espacees pour eviter les limites par minute...\n"
-        "ð¡ï¸ Filtrage des donnees insuffisantes..."
-    )
-    try:
-        result = await analyze_all_matches()
-        result["picks"] = filter_safe_picks(result.get("picks", []))
-        result["generated_at"] = now_local().strftime("%d/%m/%Y %H:%M:%S")
-        lines = [
-            f"ð ALEPH BET AI {VERSION} â RAPPORT PREMIUM",
-            f"ð Date : {result['date']}",
-            f"ð Rapport genere : {result['generated_at']} (Cote d'Ivoire)",
-            f"ð¡ï¸ Marge avant coup d'envoi : {MIN_MINUTES_BEFORE_KICKOFF} min",
-            f"â½ Matchs recuperes : {result['total']}",
-            f"ð Matchs a venir : {result['upcoming']}",
-            f"ð Tentatives d'analyse : {result['attempts']}",
-            f"ð Reponses API : {result['analyzed']}",
-            f"ð­ Sans prediction : {result['no_prediction']}",
-            f"ð§¹ Donnees ecartees : {result['invalid_data']}",
-            f"â ï¸ Erreurs API : {result['api_errors']}",
-            f"ð Budget d'analyse : {result['prediction_budget']} appels maximum", "",
-        ]
-        if result["error_details"]:
-            lines.extend(["DETAIL DES ERREURS :"])
-            lines.extend(f"â¢ {item}" for item in result["error_details"])
-            lines.append("")
-
-        if not result["picks"]:
-            lines.extend([
-                "ð AUCUNE SELECTION ASSEZ SOLIDE",
-                "Les donnees disponibles ne passent pas les filtres premium.",
-                "Le robot prefere s'abstenir plutot que forcer un pronostic.",
-            ])
-        else:
-            lines.extend([
-                f"ð¯ {len(result['picks'])} SELECTION(S) RETENUE(S)",
-                "Matchs a retrouver manuellement sur 1xBet.", "",
-            ])
-            for index, pick in enumerate(result["picks"], 1):
-                lines.extend([
-                    "ââââââââââââââââ",
-                    f"ð SELECTION #{index}",
-                    f"â½ {pick['match']}",
-                    f"ð {pick['league']}",
-                    f"ð Date : {pick['date']}",
-                    f"ð Heure : {pick['time']} (Cote d'Ivoire)", "",
-                    f"ð¯ Marche : {pick['market']}",
-                    f"ð Choix : {pick['selection']}",
-                    f"ð Estimation API : {pick['percent']:.1f} %",
-                    f"ð§  Indice qualite : {pick['quality']:.1f}/100",
-                    (
-                        "ð Base 1N2 API : "
-                        f"1={pick['home_percent']:.1f}% | "
-                        f"N={pick['draw_percent']:.1f}% | "
-                        f"2={pick['away_percent']:.1f}%"
-                    ),
-                    "ð¬ Comparaison : " + " | ".join(pick["comparison_details"]),
-                ])
-                if pick.get("advice"):
-                    lines.append(f"ð¡ Conseil API : {str(pick['advice'])[:180]}")
-                if pick.get("under_over"):
-                    lines.append(
-                        f"â½ Indication buts API : {str(pick['under_over'])[:80]} "
-                        "(sans probabilite chiffree)"
-                    )
-                lines.append("")
-
-        lines.extend([
-            "ââââââââââââââââ", "",
-            "â¹ï¸ L'estimation API n'est pas un taux de reussite historique.",
-            "â¹ï¸ L'indice qualite est un score interne, pas une probabilite.",
-            "â¹ï¸ Les comparaisons API ne remplacent pas un historique verifie.",
-            "â¹ï¸ Aucune cote ni disponibilite 1xBet n'est verifiee.",
-            "â ï¸ Aucun pari n'est sur. Ne mise que ce que tu peux perdre.",
-            f"ð Nouvelles selections ajoutees au suivi : {result['tracked']}",
-            "Utilise /bilan pour consulter les resultats suivis.",
-        ])
-        await send_long_message(update, "\n".join(lines))
-    except Exception as error:
-        logger.exception("Erreur pronostics")
-        await update.message.reply_text("â Erreur pendant l'analyse.\n" + str(error)[:250])
-
-
-async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text("ð Mise a jour des resultats en cours...")
-        store, updated, checked_dates, failed_dates, errors = await refresh_results()
-        picks = store["picks"]
-        wins = sum(1 for p in picks if p.get("result") == "win")
-        losses = sum(1 for p in picks if p.get("result") == "loss")
-        pending = sum(1 for p in picks if p.get("result") == "pending")
-        settled = wins + losses
-        rate = wins / settled * 100 if settled else None
-
-        lines = [
-            f"ð ALEPH BET AI {VERSION} â BILAN",
-            f"ð Nouveaux resultats verifies : {updated}",
-            f"ð Journees consultees avec succes : {checked_dates}",
-            f"â ï¸ Journees en erreur : {failed_dates}",
-            f"â Gagnes : {wins}",
-            f"â Perdus : {losses}",
-            f"â³ En attente : {pending}",
-            f"ð Total enregistre : {len(picks)}",
-        ]
-        if errors:
-            lines.extend(["", "DETAIL DES ERREURS API :"])
-            lines.extend(f"â¢ {detail}" for detail in errors[:3])
-        if rate is not None:
-            lines.append(f"ð Reussite observee : {rate:.1f}% ({wins}/{settled})")
-        else:
-            lines.append("ð Taux reel : pas encore calculable (aucun match termine).")
-
-        lines.extend(["", "DERNIERES SELECTIONS :"])
-        for pick in reversed(picks[-10:]):
-            icon = {"win": "â", "loss": "â", "pending": "â³"}.get(
-                pick.get("result"), "â"
-            )
-            score = f" â {pick['score']}" if pick.get("score") else ""
+            percent, label, market = recommendation
+            home, away = team_names(match)
             lines.append(
-                f"{icon} {pick.get('date')} {pick.get('time')} | "
-                f"{pick.get('match')} | {pick.get('selection')}{score}"
+                f"⚽ {home} — {away}\n"
+                f"🏆 {league_name(match)}\n"
+                f"🗓 {fmt_datetime(match_date(match))}\n"
+                f"🎯 Marché API : {label}\n"
+                f"📊 Estimation fournie par l'API : {percent:.0f}%"
             )
-        lines.extend([
-            "",
-            "â ï¸ Bilan limite aux selections enregistrees par le bot.",
-            "Il ne prouve pas un benefice financier et ne garantit pas les prochains resultats.",
-            "â ï¸ Sur Render gratuit, le fichier JSON local peut etre perdu lors d'un redemarrage ou redeploiement.",
-        ])
-        await send_long_message(update, "\n".join(lines))
-    except Exception as error:
-        logger.exception("Erreur bilan")
-        await update.message.reply_text("â Impossible d'actualiser le bilan : " + str(error)[:250])
+            shown += 1
+            if shown >= 3:
+                break
+        except Exception as exc:
+            log.warning("Prediction fixture %s: %s", fixture_id, exc)
+
+    if shown == 0:
+        await update.message.reply_text(
+            "🔎 Aucun pronostic ne passe actuellement les filtres.\n"
+            f"Matchs examinés : {min(len(matches), 6)} | Appels de prédiction tentés : {attempts}\n"
+            "C'est volontaire : le bot préfère ne rien proposer plutôt que forcer un choix."
+        )
+        return
+
+    lines += [
+        "",
+        "⚠️ Pourcentages indicatifs de l'API, pas des taux de réussite vérifiés.",
+        "Aucun pari n'est sûr. Vérifie les informations et limite strictement tes mises."
+    ]
+    await update.message.reply_text("\n\n".join(lines))
 
 
-# ------------------------- Demarrage -----------------------
+async def basket_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await sport_matches(update, "basketball", days=2, limit=12)
+
+
+async def hockey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await sport_matches(update, "hockey", days=2, limit=12)
+
+
+async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Présente les données des trois sports séparément ; ne mélange pas leurs probabilités.
+    await update.message.reply_text(
+        f"👑 ALEPH BET AI {VERSION}\n"
+        "Centre multi-sports activé.\n\n"
+        "⚽ /foot — pré-analyse football\n"
+        "🏀 /basket — matchs de basketball à venir\n"
+        "🏒 /hockey — matchs de hockey à venir\n"
+        "📊 /statut — état des trois connexions API\n\n"
+        "Le mode Premium ne force pas de sélection : basketball et hockey sont en phase de vérification des données."
+    )
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"👑 Bienvenue sur ALEPH BET AI {VERSION}\n\n"
+        "Commandes disponibles :\n"
+        "/premium — centre multi-sports\n"
+        "/foot — analyse football\n"
+        "/pronostics — alias football\n"
+        "/matchs — matchs de football à venir\n"
+        "/basket — matchs de basketball à venir\n"
+        "/hockey — matchs de hockey à venir\n"
+        "/statut — état des API\n"
+        "/aide — aide"
+    )
+
+
+async def aide_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📘 AIDE ALEPH BET AI 4.0\n\n"
+        "/foot : pré-analyse football, maximum 3 sélections si les données le permettent.\n"
+        "/pronostics : même fonction que /foot.\n"
+        "/matchs : liste les matchs de football à venir.\n"
+        "/basket : liste les matchs de basketball à venir.\n"
+        "/hockey : liste les matchs de hockey à venir.\n"
+        "/premium : centre multi-sports.\n"
+        "/statut : vérifie les connexions API.\n\n"
+        "Les matchs affichés sont filtrés pour exclure les rencontres déjà commencées ou terminées.\n"
+        "Les pourcentages football sont des estimations du fournisseur, pas des performances historiques."
+    )
+
+
+async def matchs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await sport_matches(update, "football", days=2, limit=15)
+
 
 def main():
-    missing = [
-        name for name, value in (
-            ("TELEGRAM_BOT_TOKEN", TOKEN),
-            ("WEBHOOK_URL", WEBHOOK_URL),
-            ("WEBHOOK_SECRET", WEBHOOK_SECRET),
-            ("API_FOOTBALL_KEY", API_KEY),
-        ) if not value
-    ]
-    if missing:
-        raise RuntimeError("Variables Render manquantes : " + ", ".join(missing))
+    if not TOKEN:
+        raise RuntimeError("Variable TELEGRAM_BOT_TOKEN absente.")
+    if not WEBHOOK_URL:
+        raise RuntimeError("Variable WEBHOOK_URL absente dans Render.")
 
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("aide", aide))
-    app.add_handler(CommandHandler("statut", statut))
-    app.add_handler(CommandHandler("matchs", matchs))
-    app.add_handler(CommandHandler("pronostics", pronostics))
-    app.add_handler(CommandHandler("bilan", bilan))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("aide", aide_command))
+    app.add_handler(CommandHandler("statut", status_command))
+    app.add_handler(CommandHandler("premium", premium_command))
+    app.add_handler(CommandHandler("foot", foot_command))
+    app.add_handler(CommandHandler("pronostics", foot_command))
+    app.add_handler(CommandHandler("matchs", matchs_command))
+    app.add_handler(CommandHandler("basket", basket_command))
+    app.add_handler(CommandHandler("hockey", hockey_command))
 
-    logger.info("ALEPH BET AI %s demarre...", VERSION)
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="telegram",
-        webhook_url=f"{WEBHOOK_URL.rstrip('/')}/telegram",
-        secret_token=WEBHOOK_SECRET,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    webhook_args = {
+        "listen": "0.0.0.0",
+        "port": PORT,
+        "url_path": "telegram",
+        "webhook_url": WEBHOOK_URL + "/telegram",
+        "allowed_updates": Update.ALL_TYPES,
+    }
+    if WEBHOOK_SECRET:
+        webhook_args["secret_token"] = WEBHOOK_SECRET
+
+    log.info("Starting %s", VERSION)
+    app.run_webhook(**webhook_args)
 
 
 if __name__ == "__main__":
