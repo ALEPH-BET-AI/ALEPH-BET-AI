@@ -12,8 +12,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ============================================================
-# ALEPH BET AI 3.3
-# Analyse prudente des matchs à venir + suivi des résultats
+# ALEPH BET AI 3.5
+# Analyse prudente des matchs à venir + suivi des résultats avec diagnostic API
 # ============================================================
 
 VERSION = "3.5"
@@ -98,17 +98,15 @@ def is_upcoming(fixture):
 # ------------------------- API -----------------------------
 
 def api_get(endpoint, params=None):
+    """Appel API avec détails utiles en cas d'erreur HTTP ou JSON."""
     if not API_KEY:
         raise RuntimeError("Clé API-Football absente.")
-
     response = requests.get(
         f"{API_BASE}/{endpoint}",
         headers={"x-apisports-key": API_KEY},
         params=params or {},
         timeout=REQUEST_TIMEOUT,
     )
-
-    # Conserver le détail renvoyé par le serveur en cas d'erreur HTTP.
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -118,18 +116,14 @@ def api_get(endpoint, params=None):
         except ValueError:
             detail = response.text[:300]
         raise RuntimeError(
-            f"API-Football HTTP {response.status_code}: {str(detail)[:350]}"
+            f"API-Football HTTP {response.status_code}: {str(detail)[:300]}"
         ) from exc
-
     try:
         data = response.json()
     except ValueError as exc:
-        raise RuntimeError("Réponse API invalide : JSON illisible.") from exc
-
-    if not isinstance(data, dict):
-        raise RuntimeError("Réponse API invalide : format inattendu.")
+        raise RuntimeError("Réponse API-Football invalide : JSON illisible.") from exc
     if data.get("errors"):
-        raise RuntimeError(f"Erreur API-Football : {str(data['errors'])[:350]}")
+        raise RuntimeError(f"Erreur API-Football : {str(data['errors'])[:300]}")
     return data
 
 
@@ -352,7 +346,7 @@ def settle_pick(pick, fixture):
 
 
 async def refresh_results():
-    """Actualise le suivi sans utiliser le paramètre ids (interdit en Free)."""
+    """Actualise le suivi et retourne les détails des erreurs rencontrées."""
     store = load_store()
     pending = [p for p in store["picks"] if p.get("result") == "pending"]
     if not pending:
@@ -360,7 +354,6 @@ async def refresh_results():
 
     today_local = now_local().date()
     dates_to_check = set()
-
     for pick in pending:
         raw_date = str(pick.get("date", "")).strip()
         parsed_date = None
@@ -377,7 +370,6 @@ async def refresh_results():
     checked_dates = 0
     failed_dates = 0
     errors = []
-
     for match_date in sorted(dates_to_check):
         try:
             data = await api_call(
@@ -390,15 +382,13 @@ async def refresh_results():
                 for f in fixtures
                 if f.get("fixture", {}).get("id") is not None
             }
-
             for pick in pending:
                 fixture = by_id.get(str(pick.get("fixture_id")))
                 if fixture and settle_pick(pick, fixture):
                     updated += 1
-
         except Exception as error:
             failed_dates += 1
-            detail = f"{match_date} : {str(error)[:350]}"
+            detail = f"{match_date}: {str(error)[:220]}"
             errors.append(detail)
             logger.exception("Erreur actualisation bilan pour %s", match_date)
 
@@ -727,10 +717,8 @@ async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📚 Total enregistré : {len(picks)}",
         ]
         if errors:
-            lines.extend(["", "⚠️ DÉTAIL DES ERREURS :"])
-            for error_detail in errors:
-                lines.append(f"• {error_detail}")
-
+            lines.extend(["", "DÉTAIL DES ERREURS API :"])
+            lines.extend(f"• {detail}" for detail in errors[:3])
         if rate is not None:
             lines.append(f"📈 Réussite observée : {rate:.1f}% ({wins}/{settled})")
         else:
