@@ -4,7 +4,7 @@ import logging
 import asyncio
 import time
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -13,12 +13,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ============================================================
-# ALEPH BET AI 3.7 PREMIUM
+# ALEPH BET AI 3.8 PREMIUM
 # Appels API temporises, reprises 429, filtres prudents,
 # suivi des resultats et protection du quota quotidien.
 # ============================================================
 
-VERSION = "3.7 PREMIUM"
+VERSION = "3.8 PREMIUM"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -41,6 +41,7 @@ MAX_PREDICTION_CALLS = 8
 RESERVE_API_CALLS = 8
 MAX_DISPLAY_PICKS = 3
 ONE_PICK_PER_LEAGUE = True
+MIN_MINUTES_BEFORE_KICKOFF = 10
 
 # Une requete au plus toutes les 7 secondes environ.
 # Cela reduit fortement le risque de limite par minute.
@@ -102,6 +103,42 @@ def is_upcoming(fixture):
     status = fixture.get("fixture", {}).get("status", {}).get("short", "")
     kickoff = parse_fixture_date(fixture)
     return status == "NS" and kickoff is not None and kickoff > now_local()
+
+
+def is_safe_for_pick(fixture):
+    """Autorise une selection seulement si le coup d'envoi est a plus de 10 min."""
+    kickoff = parse_fixture_date(fixture)
+    return (
+        is_upcoming(fixture)
+        and kickoff is not None
+        and kickoff > now_local() + timedelta(minutes=MIN_MINUTES_BEFORE_KICKOFF)
+    )
+
+
+def pick_is_safe(pick):
+    """Revalide l'heure d'une selection, meme lorsqu'elle vient du cache."""
+    raw = pick.get("kickoff_at")
+    kickoff = None
+    if raw:
+        try:
+            kickoff = datetime.fromisoformat(str(raw))
+            if kickoff.tzinfo is None:
+                kickoff = kickoff.replace(tzinfo=LOCAL_TZ)
+            kickoff = kickoff.astimezone(LOCAL_TZ)
+        except (ValueError, TypeError):
+            kickoff = None
+    if kickoff is None:
+        try:
+            kickoff = datetime.strptime(
+                f"{pick.get('date')} {pick.get('time')}", "%d/%m/%Y %H:%M"
+            ).replace(tzinfo=LOCAL_TZ)
+        except (ValueError, TypeError):
+            return False
+    return kickoff > now_local() + timedelta(minutes=MIN_MINUTES_BEFORE_KICKOFF)
+
+
+def filter_safe_picks(picks):
+    return [pick for pick in picks if pick_is_safe(pick)]
 
 
 # --------------------- Couche API robuste ------------------
@@ -423,6 +460,7 @@ def register_picks(picks):
             "league": pick["league"],
             "date": pick["date"],
             "time": pick["time"],
+            "kickoff_at": pick.get("kickoff_at"),
             "market": pick["market"],
             "selection": pick["selection"],
             "market_type": pick["market_type"],
@@ -526,7 +564,10 @@ async def analyze_all_matches():
         and analysis_cache["result"] is not None
         and time.time() - analysis_cache["time"] < CACHE_DURATION
     ):
-        return analysis_cache["result"]
+        cached_result = analysis_cache["result"]
+        cached_result["picks"] = filter_safe_picks(cached_result.get("picks", []))
+        cached_result["generated_at"] = now_local().strftime("%d/%m/%Y %H:%M:%S")
+        return cached_result
 
     status_data = await api_call("status")
     current, limit = get_status_info(status_data)
@@ -545,13 +586,14 @@ async def analyze_all_matches():
     else:
         prediction_budget = min(4, MAX_PREDICTION_CALLS)
 
-    chosen_fixtures = spread_fixtures(upcoming, prediction_budget)
+    safe_upcoming = [f for f in upcoming if is_safe_for_pick(f)]
+    chosen_fixtures = spread_fixtures(safe_upcoming, prediction_budget)
     candidates = []
     attempts = analyzed = no_prediction = invalid_data = api_errors = 0
     error_details = []
 
     for fixture in chosen_fixtures:
-        if not is_upcoming(fixture):
+        if not is_safe_for_pick(fixture):
             continue
         fixture_id = fixture.get("fixture", {}).get("id")
         if not fixture_id:
@@ -576,6 +618,7 @@ async def analyze_all_matches():
                 "league": get_league_name(fixture),
                 "date": format_match_date(fixture),
                 "time": format_match_time(fixture),
+                "kickoff_at": parse_fixture_date(fixture).isoformat(),
                 "market": best["market"],
                 "selection": best["selection"],
                 "percent": best["percent"],
@@ -604,16 +647,18 @@ async def analyze_all_matches():
         if len(selected) >= MAX_DISPLAY_PICKS:
             break
         original = fixture_by_id.get(str(candidate["fixture_id"]))
-        if not original or not is_upcoming(original):
+        if not original or not is_safe_for_pick(original) or not pick_is_safe(candidate):
             continue
         if ONE_PICK_PER_LEAGUE and candidate["league"] in used_leagues:
             continue
         selected.append(candidate)
         used_leagues.add(candidate["league"])
 
+    selected = filter_safe_picks(selected)
     tracked = register_picks(selected) if selected else 0
     result = {
         "date": current_date,
+        "generated_at": now_local().strftime("%d/%m/%Y %H:%M:%S"),
         "total": len(fixtures),
         "upcoming": len(upcoming),
         "attempts": attempts,
@@ -725,9 +770,13 @@ async def pronostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     try:
         result = await analyze_all_matches()
+        result["picks"] = filter_safe_picks(result.get("picks", []))
+        result["generated_at"] = now_local().strftime("%d/%m/%Y %H:%M:%S")
         lines = [
             f"ð ALEPH BET AI {VERSION} â RAPPORT PREMIUM",
-            f"ð Date : {result['date']}", "",
+            f"ð Date : {result['date']}",
+            f"ð Rapport genere : {result['generated_at']} (Cote d'Ivoire)",
+            f"ð¡ï¸ Marge avant coup d'envoi : {MIN_MINUTES_BEFORE_KICKOFF} min",
             f"â½ Matchs recuperes : {result['total']}",
             f"ð Matchs a venir : {result['upcoming']}",
             f"ð Tentatives d'analyse : {result['attempts']}",
