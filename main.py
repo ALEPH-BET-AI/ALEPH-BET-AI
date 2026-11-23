@@ -16,7 +16,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # Analyse prudente des matchs à venir + suivi des résultats
 # ============================================================
 
-VERSION = "3.3"
+VERSION = "3.4"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -332,33 +332,58 @@ def settle_pick(pick, fixture):
 
 
 async def refresh_results():
+    """Actualise le suivi sans utiliser le paramètre ids (interdit en Free)."""
     store = load_store()
     pending = [p for p in store["picks"] if p.get("result") == "pending"]
     if not pending:
-        return store, 0
+        return store, 0, 0, 0
 
-    # L'API-Football accepte une liste d'identifiants de fixtures via ids.
-    # Lots de 20 pour limiter les appels.
+    # Les sélections conservent leur date locale au format JJ/MM/AAAA.
+    # L'API accepte déjà le filtre date utilisé par /matchs et /pronostics.
+    today_local = now_local().date()
+    dates_to_check = set()
+    for pick in pending:
+        raw_date = str(pick.get("date", "")).strip()
+        parsed_date = None
+        for date_format in ("%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                parsed_date = datetime.strptime(raw_date, date_format).date()
+                break
+            except ValueError:
+                continue
+        if parsed_date and parsed_date <= today_local:
+            dates_to_check.add(parsed_date.isoformat())
+
     updated = 0
-    ids = list(dict.fromkeys(str(p["fixture_id"]) for p in pending if p.get("fixture_id")))
-    for start in range(0, len(ids), 20):
-        batch = ids[start:start + 20]
-        data = await api_call("fixtures", {"ids": "-".join(batch), "timezone": TIMEZONE})
-        fixtures = get_response_list(data)
-        by_id = {
-            str(f.get("fixture", {}).get("id")): f
-            for f in fixtures
-        }
-        for pick in pending:
-            fixture = by_id.get(str(pick.get("fixture_id")))
-            if fixture and settle_pick(pick, fixture):
-                updated += 1
+    checked_dates = 0
+    failed_dates = 0
+    for match_date in sorted(dates_to_check):
+        try:
+            data = await api_call(
+                "fixtures", {"date": match_date, "timezone": TIMEZONE}
+            )
+            checked_dates += 1
+            fixtures = get_response_list(data)
+            by_id = {
+                str(f.get("fixture", {}).get("id")): f
+                for f in fixtures
+                if f.get("fixture", {}).get("id") is not None
+            }
+            for pick in pending:
+                fixture = by_id.get(str(pick.get("fixture_id")))
+                if fixture and settle_pick(pick, fixture):
+                    updated += 1
+        except Exception as error:
+            failed_dates += 1
+            logger.warning(
+                "Erreur actualisation bilan pour %s : %s", match_date, error
+            )
 
     save_store(store)
-    return store, updated
+    return store, updated, checked_dates, failed_dates
 
 
-# ---------------------- Moteur 3.3 -------------------------
+# ---------------------- Moteur 3.4 -------------------------
 
 async def analyze_all_matches():
     current_date = today()
@@ -660,7 +685,7 @@ async def pronostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("📊 Mise à jour des résultats en cours...")
-        store, updated = await refresh_results()
+        store, updated, checked_dates, failed_dates = await refresh_results()
         picks = store["picks"]
         wins = sum(1 for p in picks if p.get("result") == "win")
         losses = sum(1 for p in picks if p.get("result") == "loss")
@@ -671,6 +696,8 @@ async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [
             f"📊 ALEPH BET AI {VERSION} — BILAN",
             f"🔄 Nouveaux résultats vérifiés : {updated}",
+            f"📅 Journées consultées : {checked_dates}",
+            f"⚠️ Journées en erreur : {failed_dates}",
             f"✅ Gagnés : {wins}",
             f"❌ Perdus : {losses}",
             f"⏳ En attente : {pending}",
