@@ -1,8 +1,9 @@
+
 import os
 import logging
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -10,7 +11,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # =====================================
-# CONFIGURATION
+# ALEPH BET AI 3.2
 # =====================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -22,35 +23,113 @@ PORT = int(os.getenv("PORT", "10000"))
 API_BASE = "https://v3.football.api-sports.io"
 TIMEZONE = "Africa/Abidjan"
 
-# Seuils expérimentaux
 MIN_WIN_PERCENT = 65.0
 MIN_DOUBLE_CHANCE_PERCENT = 78.0
 
-# Contrôle qualité des probabilités
 MIN_1X2_SUM = 97.0
 MAX_1X2_SUM = 103.0
-MAX_ACCEPTED_MARKET_PERCENT = 98.9  # Les valeurs proches de 100 % sont écartées
+MAX_ACCEPTED_MARKET_PERCENT = 98.9
 
-# Quota API
-MAX_PREDICTION_CALLS = 25
-RESERVE_API_CALLS = 3
+MAX_PREDICTION_CALLS = 12
+MAX_ODDS_CHECKS = 8
+MAX_FINAL_CHECKS = 3
+RESERVE_API_CALLS = 5
 
-# Maximum 3 sélections ; aucune obligation d'en produire 2
 MAX_DISPLAY_PICKS = 3
-
-# Diversification : éviter deux sélections du même championnat
 ONE_PICK_PER_LEAGUE = True
 
-# Cache
 CACHE_DURATION = 1800
+MAX_FIXTURE_AGE_SECONDS = 0
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+# Évite notamment d'afficher le token Telegram dans les logs HTTP.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
-analysis_cache = {"time": 0, "date": None, "result": None}
+analysis_cache = {
+    "time": 0,
+    "date": None,
+    "result": None,
+}
+
+
+# =====================================
+# HORLOGE
+# =====================================
+
+def now_local():
+    return datetime.now(ZoneInfo(TIMEZONE))
+
+
+def today():
+    return now_local().date().isoformat()
+
+
+def parse_fixture_date(fixture):
+    date_text = fixture.get("fixture", {}).get("date")
+
+    if not date_text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(
+            date_text.replace("Z", "+00:00")
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(ZoneInfo(TIMEZONE))
+
+    except (ValueError, TypeError):
+        return None
+
+
+def format_match_date(fixture):
+    match_date = parse_fixture_date(fixture)
+
+    if not match_date:
+        return "Date inconnue"
+
+    return match_date.strftime("%d/%m/%Y")
+
+
+def format_match_time(fixture):
+    match_date = parse_fixture_date(fixture)
+
+    if not match_date:
+        return "Heure inconnue"
+
+    return match_date.strftime("%H:%M")
+
+
+def is_upcoming(fixture):
+    """
+    Seuls les matchs NS sont acceptés.
+    TBD, LIVE, HT, FT, reportés et annulés sont exclus.
+    """
+
+    status = (
+        fixture.get("fixture", {})
+        .get("status", {})
+        .get("short", "")
+    )
+
+    if status != "NS":
+        return False
+
+    kickoff = parse_fixture_date(fixture)
+
+    if not kickoff:
+        return False
+
+    return kickoff > now_local()
 
 
 # =====================================
@@ -67,7 +146,9 @@ def api_get(endpoint, params=None):
         params=params or {},
         timeout=25,
     )
+
     response.raise_for_status()
+
     data = response.json()
 
     if data.get("errors"):
@@ -82,21 +163,27 @@ async def api_call(endpoint, params=None):
 
 def get_response_list(data):
     result = data.get("response", [])
+
     if isinstance(result, list):
         return result
+
     if isinstance(result, dict):
         return [result]
+
     return []
 
 
 def get_status_info(data):
     response = data.get("response", {})
+
     if isinstance(response, list):
         response = response[0] if response else {}
+
     if not isinstance(response, dict):
         return None, None
 
     requests_info = response.get("requests", {})
+
     if not isinstance(requests_info, dict):
         return None, None
 
@@ -112,60 +199,46 @@ def get_status_info(data):
     return current, limit
 
 
-def today():
-    return datetime.now(ZoneInfo(TIMEZONE)).date().isoformat()
-
-
 # =====================================
-# MATCHS
+# INFORMATIONS MATCH
 # =====================================
-
-def format_match_time(fixture):
-    date_text = fixture.get("fixture", {}).get("date")
-    if not date_text:
-        return "Inconnue"
-
-    try:
-        match_date = datetime.fromisoformat(
-            date_text.replace("Z", "+00:00")
-        ).astimezone(ZoneInfo(TIMEZONE))
-        return match_date.strftime("%H:%M")
-    except (ValueError, TypeError):
-        return "Inconnue"
-
-
-def is_upcoming(fixture):
-    status = fixture.get("fixture", {}).get("status", {}).get("short", "")
-    return status in ("NS", "TBD")
-
 
 def get_fixture_name(fixture):
     teams = fixture.get("teams", {})
+
     home = teams.get("home", {}).get("name", "Domicile")
     away = teams.get("away", {}).get("name", "Extérieur")
+
     return f"{home} - {away}"
 
 
 def get_league_name(fixture):
-    return fixture.get("league", {}).get("name", "Championnat inconnu")
+    return fixture.get("league", {}).get(
+        "name",
+        "Championnat inconnu"
+    )
 
 
 def parse_percent(value):
     if value is None:
         return None
+
     try:
         number = float(str(value).replace("%", "").strip())
+
         if 0 <= number <= 100:
             return number
+
     except (ValueError, TypeError):
         pass
+
     return None
 
 
 def spread_fixtures(fixtures, count):
-    """Échantillonne les horaires sur toute la journée, sans analyser seulement le début."""
     if count <= 0:
         return []
+
     if len(fixtures) <= count:
         return fixtures
 
@@ -177,9 +250,9 @@ def spread_fixtures(fixtures, count):
         for i in range(count)
     ]
 
-    # Dédupliquer les index tout en conservant l'ordre
     chosen = []
     seen = set()
+
     for index in indexes:
         if index not in seen:
             chosen.append(fixtures[index])
@@ -189,15 +262,17 @@ def spread_fixtures(fixtures, count):
 
 
 # =====================================
-# VALIDATION ET MARCHÉS
+# ANALYSE DES PRONOSTICS
 # =====================================
 
 def extract_markets(prediction_data):
     predictions = prediction_data.get("predictions", {})
+
     if not isinstance(predictions, dict):
-        return {"markets": [], "reason": "Bloc prédictions absent"}
+        return {"markets": [], "reason": "Prédictions absentes"}
 
     percent = predictions.get("percent", {})
+
     if not isinstance(percent, dict):
         return {"markets": [], "reason": "Pourcentages absents"}
 
@@ -206,18 +281,18 @@ def extract_markets(prediction_data):
     away = parse_percent(percent.get("away"))
 
     if home is None or draw is None or away is None:
-        return {"markets": [], "reason": "Pourcentages 1N2 incomplets"}
+        return {"markets": [], "reason": "1N2 incomplet"}
 
     total = home + draw + away
-    if not (MIN_1X2_SUM <= total <= MAX_1X2_SUM):
+
+    if not MIN_1X2_SUM <= total <= MAX_1X2_SUM:
         return {
             "markets": [],
-            "reason": f"Somme 1N2 incohérente ({total:.1f} %)",
+            "reason": f"Somme 1N2 incohérente : {total:.1f}%",
         }
 
     markets = []
 
-    # Victoires simples
     if home >= MIN_WIN_PERCENT:
         markets.append({
             "market": "Victoire domicile",
@@ -234,7 +309,6 @@ def extract_markets(prediction_data):
             "type": "victoire",
         })
 
-    # Le nul est conservé uniquement s'il franchit le seuil expérimental
     if draw >= MIN_WIN_PERCENT:
         markets.append({
             "market": "Match nul",
@@ -243,7 +317,6 @@ def extract_markets(prediction_data):
             "type": "nul",
         })
 
-    # Doubles chances, plafonnées à 100 pour éviter un dépassement dû aux arrondis
     chance_1x = min(100.0, home + draw)
     chance_x2 = min(100.0, away + draw)
     chance_12 = min(100.0, home + away)
@@ -272,29 +345,19 @@ def extract_markets(prediction_data):
             "type": "double",
         })
 
-    # Écarter les valeurs extrêmes : elles ne sont pas traitées comme des certitudes.
     markets = [
         market for market in markets
         if market["percent"] <= MAX_ACCEPTED_MARKET_PERCENT
     ]
 
-    markets.sort(key=lambda item: item["percent"], reverse=True)
-
-    # Données buts : on conserve uniquement les champs réellement fournis par l'API.
-    under_over = predictions.get("under_over")
-    goals = predictions.get("goals", {})
-    if not isinstance(goals, dict):
-        goals = {}
-
-    advice = predictions.get("advice")
+    markets.sort(
+        key=lambda item: item["percent"],
+        reverse=True
+    )
 
     return {
         "markets": markets,
         "reason": None,
-        "under_over": under_over,
-        "goal_home": goals.get("home"),
-        "goal_away": goals.get("away"),
-        "advice": advice,
         "home_percent": home,
         "draw_percent": draw,
         "away_percent": away,
@@ -303,7 +366,157 @@ def extract_markets(prediction_data):
 
 
 # =====================================
-# MOTEUR ALEPH BET AI 3.1
+# RECHERCHE BOOKMAKER 1XBET
+# =====================================
+
+async def find_1xbet():
+    data = await api_call(
+        "odds/bookmakers",
+        {"search": "1xBet"}
+    )
+
+    bookmakers = get_response_list(data)
+
+    for bookmaker in bookmakers:
+        name = str(bookmaker.get("name", "")).lower()
+
+        if "1xbet" in name.replace(" ", ""):
+            bookmaker_id = bookmaker.get("id")
+
+            if bookmaker_id:
+                return {
+                    "id": bookmaker_id,
+                    "name": bookmaker.get("name", "1xBet"),
+                }
+
+    return None
+
+
+# =====================================
+# COTES 1X2 1XBET
+# =====================================
+
+def extract_1x2_odds(odds_data):
+    responses = get_response_list(odds_data)
+
+    if not responses:
+        return None
+
+    for item in responses:
+        bookmakers = item.get("bookmakers", [])
+
+        for bookmaker in bookmakers:
+            bookmaker_name = str(
+                bookmaker.get("name", "")
+            ).lower().replace(" ", "")
+
+            if "1xbet" not in bookmaker_name:
+                continue
+
+            result = {
+                "home": None,
+                "draw": None,
+                "away": None,
+            }
+
+            for bet in bookmaker.get("bets", []):
+                bet_name = str(bet.get("name", "")).lower()
+
+                if bet_name not in (
+                    "match winner",
+                    "1x2",
+                    "fulltime result",
+                ):
+                    continue
+
+                for value in bet.get("values", []):
+                    label = str(
+                        value.get("value", "")
+                    ).strip().lower()
+
+                    odd = value.get("odd")
+
+                    try:
+                        odd = float(odd)
+                    except (TypeError, ValueError):
+                        continue
+
+                    if label in ("home", "1", "team 1"):
+                        result["home"] = odd
+
+                    elif label in ("draw", "x", "tie"):
+                        result["draw"] = odd
+
+                    elif label in ("away", "2", "team 2"):
+                        result["away"] = odd
+
+            if all(result.values()):
+                return result
+
+    return None
+
+
+async def check_1xbet_odds(fixture_id, bookmaker):
+    data = await api_call(
+        "odds",
+        {
+            "fixture": fixture_id,
+            "bookmaker": bookmaker["id"],
+        },
+    )
+
+    responses = get_response_list(data)
+
+    if not responses:
+        return None
+
+    for item in responses:
+        for book in item.get("bookmakers", []):
+            name = str(
+                book.get("name", "")
+            ).lower().replace(" ", "")
+
+            if "1xbet" not in name:
+                continue
+
+            if not book.get("bets"):
+                continue
+
+            odds = extract_1x2_odds({"response": [item]})
+
+            return {
+                "bookmaker": book.get("name", "1xBet"),
+                "odds": odds,
+            }
+
+    return None
+
+
+# =====================================
+# DERNIÈRE VÉRIFICATION DU MATCH
+# =====================================
+
+async def final_fixture_check(fixture_id):
+    data = await api_call(
+        "fixtures",
+        {"id": fixture_id, "timezone": TIMEZONE},
+    )
+
+    fixtures = get_response_list(data)
+
+    if not fixtures:
+        return None
+
+    fixture = fixtures[0]
+
+    if not is_upcoming(fixture):
+        return None
+
+    return fixture
+
+
+# =====================================
+# MOTEUR 3.2
 # =====================================
 
 async def analyze_all_matches():
@@ -321,39 +534,84 @@ async def analyze_all_matches():
 
     fixtures_data = await api_call(
         "fixtures",
-        {"date": current_date, "timezone": TIMEZONE},
+        {
+            "date": current_date,
+            "timezone": TIMEZONE,
+        },
     )
+
     fixtures = get_response_list(fixtures_data)
 
-    upcoming = [fixture for fixture in fixtures if is_upcoming(fixture)]
+    upcoming = [
+        fixture for fixture in fixtures
+        if is_upcoming(fixture)
+    ]
+
     upcoming.sort(
         key=lambda item: item.get("fixture", {}).get("date", "")
     )
 
     if isinstance(current, int) and isinstance(limit, int):
-        remaining = max(0, limit - current - RESERVE_API_CALLS)
-        call_limit = min(MAX_PREDICTION_CALLS, remaining)
-    else:
-        call_limit = min(10, MAX_PREDICTION_CALLS)
+        remaining = max(
+            0,
+            limit - current - RESERVE_API_CALLS - 2
+        )
 
-    fixtures_to_analyze = spread_fixtures(upcoming, call_limit)
+        total_extra_budget = min(
+            MAX_PREDICTION_CALLS
+            + MAX_ODDS_CHECKS
+            + MAX_FINAL_CHECKS,
+            remaining,
+        )
+    else:
+        total_extra_budget = 10
+
+    # Répartition prudente du quota disponible.
+    prediction_limit = min(
+        MAX_PREDICTION_CALLS,
+        max(0, int(total_extra_budget * 0.55)),
+    )
+
+    odds_limit = min(
+        MAX_ODDS_CHECKS,
+        max(0, int(total_extra_budget * 0.30)),
+    )
+
+    final_limit = min(
+        MAX_FINAL_CHECKS,
+        max(0, total_extra_budget - prediction_limit - odds_limit),
+    )
 
     candidates = []
+
     attempts = 0
     analyzed = 0
     no_prediction = 0
     invalid_data = 0
     api_errors = 0
 
+    fixtures_to_analyze = spread_fixtures(
+        upcoming,
+        prediction_limit,
+    )
+
     for fixture in fixtures_to_analyze:
         fixture_id = fixture.get("fixture", {}).get("id")
+
         if not fixture_id:
+            continue
+
+        if not is_upcoming(fixture):
             continue
 
         attempts += 1
 
         try:
-            data = await api_call("predictions", {"fixture": fixture_id})
+            data = await api_call(
+                "predictions",
+                {"fixture": fixture_id},
+            )
+
             responses = get_response_list(data)
 
             if not responses:
@@ -361,15 +619,11 @@ async def analyze_all_matches():
                 continue
 
             analyzed += 1
+
             prediction = extract_markets(responses[0])
 
             if prediction.get("reason"):
                 invalid_data += 1
-                logger.info(
-                    "Données non retenues fixture %s : %s",
-                    fixture_id,
-                    prediction["reason"],
-                )
                 continue
 
             if not prediction["markets"]:
@@ -382,15 +636,12 @@ async def analyze_all_matches():
                 "fixture_id": fixture_id,
                 "match": get_fixture_name(fixture),
                 "league": get_league_name(fixture),
+                "date": format_match_date(fixture),
                 "time": format_match_time(fixture),
                 "market": best_market["market"],
                 "selection": best_market["selection"],
                 "percent": best_market["percent"],
                 "market_type": best_market["type"],
-                "under_over": prediction.get("under_over"),
-                "goal_home": prediction.get("goal_home"),
-                "goal_away": prediction.get("goal_away"),
-                "advice": prediction.get("advice"),
                 "home_percent": prediction["home_percent"],
                 "draw_percent": prediction["draw_percent"],
                 "away_percent": prediction["away_percent"],
@@ -400,30 +651,101 @@ async def analyze_all_matches():
         except Exception as error:
             api_errors += 1
             logger.warning(
-                "Erreur analyse match %s : %s",
+                "Erreur prédiction %s : %s",
                 fixture_id,
                 error,
             )
 
-    candidates.sort(key=lambda item: item["percent"], reverse=True)
+    candidates.sort(
+        key=lambda item: item["percent"],
+        reverse=True
+    )
+
+    bookmaker = None
+
+    if candidates and odds_limit > 0:
+        try:
+            bookmaker = await find_1xbet()
+        except Exception as error:
+            api_errors += 1
+            logger.warning(
+                "Recherche bookmaker 1xBet : %s",
+                error,
+            )
+
+    verified_candidates = []
+    odds_checks = 0
+
+    if bookmaker:
+        for candidate in candidates:
+            if odds_checks >= odds_limit:
+                break
+
+            odds_checks += 1
+
+            try:
+                odds_result = await check_1xbet_odds(
+                    candidate["fixture_id"],
+                    bookmaker,
+                )
+
+                if not odds_result:
+                    continue
+
+                candidate["bookmaker"] = odds_result["bookmaker"]
+                candidate["odds_1x2"] = odds_result["odds"]
+
+                verified_candidates.append(candidate)
+
+            except Exception as error:
+                api_errors += 1
+                logger.warning(
+                    "Erreur cotes 1xBet %s : %s",
+                    candidate["fixture_id"],
+                    error,
+                )
 
     selected = []
-    used_fixtures = set()
     used_leagues = set()
+    final_checks = 0
 
-    for candidate in candidates:
-        if candidate["fixture_id"] in used_fixtures:
-            continue
-
-        if ONE_PICK_PER_LEAGUE and candidate["league"] in used_leagues:
-            continue
-
-        selected.append(candidate)
-        used_fixtures.add(candidate["fixture_id"])
-        used_leagues.add(candidate["league"])
-
+    for candidate in verified_candidates:
         if len(selected) >= MAX_DISPLAY_PICKS:
             break
+
+        if (
+            ONE_PICK_PER_LEAGUE
+            and candidate["league"] in used_leagues
+        ):
+            continue
+
+        if final_checks >= final_limit:
+            break
+
+        final_checks += 1
+
+        try:
+            fresh_fixture = await final_fixture_check(
+                candidate["fixture_id"]
+            )
+
+            if not fresh_fixture:
+                continue
+
+            # Actualisation de la date et de l'heure.
+            candidate["date"] = format_match_date(fresh_fixture)
+            candidate["time"] = format_match_time(fresh_fixture)
+
+            selected.append(candidate)
+            used_leagues.add(candidate["league"])
+
+        except Exception as error:
+            api_errors += 1
+            logger.warning(
+                "Vérification finale %s : %s",
+                candidate["fixture_id"],
+                error,
+            )
 
     result = {
         "date": current_date,
@@ -434,18 +756,22 @@ async def analyze_all_matches():
         "no_prediction": no_prediction,
         "invalid_data": invalid_data,
         "api_errors": api_errors,
-        "quota_limit": call_limit,
+        "quota_limit": total_extra_budget,
+        "bookmaker_found": bookmaker is not None,
+        "odds_checks": odds_checks,
+        "final_checks": final_checks,
         "picks": selected,
     }
 
     analysis_cache["time"] = time.time()
     analysis_cache["date"] = current_date
     analysis_cache["result"] = result
+
     return result
 
 
 # =====================================
-# MESSAGES TELEGRAM
+# TELEGRAM
 # =====================================
 
 async def send_long_message(update, message):
@@ -457,6 +783,7 @@ async def send_long_message(update, message):
             break
 
         split_at = message.rfind("\n", 0, max_length)
+
         if split_at == -1:
             split_at = max_length
 
@@ -465,29 +792,28 @@ async def send_long_message(update, message):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = (
-        "👑 BIENVENUE SUR ALEPH BET AI 3.1 !\n\n"
-        "⚽ Assistant d'analyse football.\n"
-        "🎯 Maximum 3 sélections, sans obligation d'en proposer.\n"
-        "📊 Victoire et double chance en priorité.\n"
-        "⚽ Indications de buts uniquement si l'API les fournit.\n"
-        "🛑 Contrôle des probabilités extrêmes et incohérentes.\n\n"
+    await update.message.reply_text(
+        "👑 BIENVENUE SUR ALEPH BET AI 3.2 !\n\n"
+        "⚽ Analyse de matchs de football.\n"
+        "📅 Dates complètes et heures ivoiriennes.\n"
+        "🔎 Vérification des cotes 1xBet disponibles.\n"
+        "🛑 Exclusion des matchs commencés ou terminés.\n"
+        "🎯 Maximum 3 sélections, sans obligation.\n\n"
         "COMMANDES :\n"
         "/matchs - Matchs à venir\n"
         "/pronostics - Analyse approfondie\n"
-        "/statut - Vérifier API et quota\n"
+        "/statut - API et quota\n"
         "/aide - Aide\n\n"
-        "⚠️ Une estimation n'est jamais une garantie de gain."
+        "⚠️ Une estimation n'est jamais une garantie."
     )
-    await update.message.reply_text(message)
 
 
 async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = (
-        "🤖 ALEPH BET AI 3.1\n\n"
+    await update.message.reply_text(
+        "🤖 ALEPH BET AI 3.2\n\n"
         "/start : Accueil\n"
         "/matchs : Matchs à venir\n"
-        "/pronostics : Meilleures sélections\n"
+        "/pronostics : Sélections vérifiées\n"
         "/statut : Connexion et quota\n\n"
         "MARCHÉS :\n"
         "1 : Victoire domicile\n"
@@ -496,11 +822,9 @@ async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1X : Domicile ou nul\n"
         "X2 : Extérieur ou nul\n"
         "12 : Une des deux équipes gagne\n\n"
-        "Maximum 3 matchs par rapport.\n"
-        "Les probabilités sont des estimations API, pas des taux "
-        "de réussite historiques."
+        "Les pourcentages sont des estimations API, "
+        "pas des taux de réussite historiques."
     )
-    await update.message.reply_text(message)
 
 
 async def statut(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -509,7 +833,7 @@ async def statut(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current, limit = get_status_info(data)
 
         message = (
-            "🤖 ALEPH BET AI 3.1\n"
+            "👑 ALEPH BET AI 3.2\n"
             "🟢 Connexion API-Football : active\n"
         )
 
@@ -524,9 +848,10 @@ async def statut(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as error:
         logger.exception("Erreur statut")
+
         await update.message.reply_text(
             "🔴 Connexion API impossible.\n"
-            f"{str(error)[:400]}"
+            f"{str(error)[:300]}"
         )
 
 
@@ -534,10 +859,19 @@ async def matchs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await api_call(
             "fixtures",
-            {"date": today(), "timezone": TIMEZONE},
+            {
+                "date": today(),
+                "timezone": TIMEZONE,
+            },
         )
+
         fixtures = get_response_list(data)
-        upcoming = [fixture for fixture in fixtures if is_upcoming(fixture)]
+
+        upcoming = [
+            fixture for fixture in fixtures
+            if is_upcoming(fixture)
+        ]
+
         upcoming.sort(
             key=lambda item: item.get("fixture", {}).get("date", "")
         )
@@ -555,107 +889,131 @@ async def matchs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
 
         for fixture in upcoming[:30]:
-            lines.append(
-                f"🕒 {format_match_time(fixture)}\n"
-                f"🏆 {get_league_name(fixture)}\n"
-                f"⚽ {get_fixture_name(fixture)}\n"
-            )
-
-        if len(upcoming) > 30:
-            lines.append(f"... et {len(upcoming) - 30} autres matchs.")
+            lines.extend([
+                f"📅 {format_match_date(fixture)}",
+                f"🕒 {format_match_time(fixture)}",
+                f"🏆 {get_league_name(fixture)}",
+                f"⚽ {get_fixture_name(fixture)}",
+                "",
+            ])
 
         await send_long_message(update, "\n".join(lines))
 
     except Exception as error:
         logger.exception("Erreur matchs")
+
         await update.message.reply_text(
-            f"❌ Erreur récupération matchs : {str(error)[:400]}"
+            f"❌ Erreur récupération matchs : {str(error)[:300]}"
         )
 
 
 async def pronostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👑 ALEPH BET AI 3.1\n"
-        "🔎 Analyse des matchs répartis sur la journée...\n"
-        "🛡️ Vérification des probabilités et des données."
+        "👑 ALEPH BET AI 3.2\n"
+        "🔎 Analyse des matchs à venir...\n"
+        "🛡️ Contrôle des horaires et des statuts...\n"
+        "🔍 Recherche des cotes 1xBet..."
     )
 
     try:
         result = await analyze_all_matches()
 
         lines = [
-            "👑 ALEPH BET AI 3.1 — RAPPORT DU JOUR",
-            f"📅 Date : {result['date']}",
+            "👑 ALEPH BET AI 3.2 — RAPPORT DU JOUR",
+            f"📅 Date du rapport : {result['date']}",
             "",
             f"⚽ Matchs récupérés : {result['total']}",
             f"🕒 Matchs à venir : {result['upcoming']}",
             f"🔍 Tentatives d'analyse : {result['attempts']}",
-            f"📊 Réponses API reçues : {result['analyzed']}",
+            f"📊 Réponses API : {result['analyzed']}",
             f"📭 Sans prédiction : {result['no_prediction']}",
-            f"🧹 Données écartées / marchés insuffisants : {result['invalid_data']}",
+            f"🧹 Données écartées : {result['invalid_data']}",
             f"⚠️ Erreurs API : {result['api_errors']}",
+            f"🔎 Contrôles de cotes : {result['odds_checks']}",
             "",
         ]
 
+        if not result["bookmaker_found"]:
+            lines.extend([
+                "⚠️ Bookmaker 1xBet non trouvé dans les données API.",
+                "Aucun match ne sera présenté comme vérifié.",
+                "",
+            ])
+
         if not result["picks"]:
             lines.extend([
-                "🛑 Aucune sélection suffisamment solide.",
-                "Le robot préfère ne pas proposer de pari fragile.",
+                "🛑 AUCUNE SÉLECTION RETENUE",
+                "",
+                "Le robot n'a pas trouvé de match réunissant",
+                "les critères de qualité et de disponibilité 1xBet.",
+                "Il préfère ne pas proposer de pari fragile.",
             ])
+
         else:
             lines.extend([
-                f"🎯 {len(result['picks'])} SÉLECTION(S) RETENUE(S)",
+                f"🎯 {len(result['picks'])} SÉLECTION(S) VÉRIFIÉE(S)",
                 "",
             ])
 
             for index, pick in enumerate(result["picks"], start=1):
                 lines.extend([
-                    "━━━━━━━━━━━━━━",
+                    "━━━━━━━━━━━━━━━━",
                     f"🏅 SÉLECTION #{index}",
                     f"⚽ {pick['match']}",
                     f"🏆 {pick['league']}",
-                    f"🕒 Heure : {pick['time']}",
+                    f"📅 Date : {pick['date']}",
+                    f"🕒 Heure : {pick['time']} (Côte d'Ivoire)",
                     "",
-                    f"📌 Marché : {pick['market']}",
-                    f"🎯 Choix : {pick['selection']}",
-                    f"📊 Estimation API : {pick['percent']:.1f} %",
+                    "📊 COTES 1X2 — 1xBet",
+                ])
+
+                odds = pick.get("odds_1x2")
+
+                if odds:
+                    lines.extend([
+                        f"1️⃣ Domicile : {odds['home']}",
+                        f"❌ Nul : {odds['draw']}",
+                        f"2️⃣ Extérieur : {odds['away']}",
+                    ])
+                else:
+                    lines.append(
+                        "Cotes 1X2 non fournies par l'API."
+                    )
+
+                lines.extend([
+                    "",
+                    f"🎯 Marché : {pick['market']}",
+                    f"📌 Choix : {pick['selection']}",
+                    f"📈 Estimation API : {pick['percent']:.1f} %",
+                    "",
                     (
-                        "📈 Base 1N2 API : "
+                        "Base 1N2 : "
                         f"1={pick['home_percent']:.1f}% | "
                         f"N={pick['draw_percent']:.1f}% | "
                         f"2={pick['away_percent']:.1f}%"
                     ),
+                    f"🔎 Bookmaker : {pick['bookmaker']}",
+                    "",
                 ])
 
-                if pick["under_over"] not in (None, "", "0"):
-                    lines.append(
-                        f"⚽ Ligne buts indiquée par l'API : {pick['under_over']}"
-                    )
-
-                if pick["advice"]:
-                    lines.append(f"💡 Conseil API : {pick['advice']}")
-
-                lines.append("")
-
         lines.extend([
-            "━━━━━━━━━━━━━━",
-            f"🔋 Appels de prédiction autorisés : {result['quota_limit']}",
+            "━━━━━━━━━━━━━━━━",
             "",
-            "ℹ️ Les doubles chances sont calculées à partir des estimations 1N2.",
-            "ℹ️ Les marchés proches de 100 % sont écartés par prudence.",
-            "ℹ️ Les indications de buts ne sont pas converties en probabilités.",
-            "",
-            "⚠️ Estimations API uniquement : aucun taux de réussite historique "
-            "n'est encore calculé.",
+            "ℹ️ Les estimations ne sont pas des taux de réussite historiques.",
+            "ℹ️ Les cotes affichées proviennent des données API disponibles.",
+            "ℹ️ La présence dans l'API ne garantit pas la disponibilité",
+            "dans chaque version régionale de 1xBet.",
+            "⚠️ Aucun pari n'est garanti.",
         ])
 
         await send_long_message(update, "\n".join(lines))
 
     except Exception as error:
         logger.exception("Erreur pronostics")
+
         await update.message.reply_text(
             "❌ Erreur pendant l'analyse.\n"
-            f"{str(error)[:400]}"
+            f"{str(error)[:300]}"
         )
 
 
@@ -666,10 +1024,13 @@ async def pronostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN manquant.")
+
     if not WEBHOOK_URL:
         raise RuntimeError("WEBHOOK_URL manquant.")
+
     if not WEBHOOK_SECRET:
         raise RuntimeError("WEBHOOK_SECRET manquant.")
+
     if not API_KEY:
         raise RuntimeError("API_FOOTBALL_KEY manquant.")
 
@@ -681,7 +1042,7 @@ def main():
     app.add_handler(CommandHandler("matchs", matchs))
     app.add_handler(CommandHandler("pronostics", pronostics))
 
-    logger.info("ALEPH BET AI 3.1 démarre...")
+    logger.info("ALEPH BET AI 3.2 démarre...")
 
     app.run_webhook(
         listen="0.0.0.0",
