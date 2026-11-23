@@ -12,11 +12,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ============================================================
-# ALEPH BET AI 3.5
-# Analyse prudente des matchs à venir + suivi des résultats avec diagnostic API
+# ALEPH BET AI 3.6 PREMIUM
+# Analyse multi-critères via /predictions, filtres prudents,
+# suivi des résultats et diagnostic API.
 # ============================================================
 
-VERSION = "3.5"
+VERSION = "3.6 PREMIUM"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -27,14 +28,16 @@ API_BASE = "https://v3.football.api-sports.io"
 TIMEZONE = "Africa/Abidjan"
 LOCAL_TZ = ZoneInfo(TIMEZONE)
 
-# Filtres de sélection. Ce sont des seuils de tri, pas des garanties.
+# Seuils de sélection : ils ne constituent jamais une garantie.
 MIN_WIN_PERCENT = 65.0
-MIN_DOUBLE_CHANCE_PERCENT = 78.0
+MIN_DOUBLE_CHANCE_PERCENT = 80.0
 MIN_1X2_SUM = 97.0
 MAX_1X2_SUM = 103.0
 MAX_ACCEPTED_PERCENT = 96.0
 
-# Quota API : limiter les appels pour préserver l'offre gratuite.
+# Analyse premium : il faut suffisamment de critères comparatifs.
+MIN_COMPARISON_METRICS = 4
+MIN_QUALITY_SCORE = 58.0
 MAX_PREDICTION_CALLS = 12
 RESERVE_API_CALLS = 5
 MAX_DISPLAY_PICKS = 3
@@ -91,14 +94,12 @@ def format_match_time(fixture):
 def is_upcoming(fixture):
     status = fixture.get("fixture", {}).get("status", {}).get("short", "")
     kickoff = parse_fixture_date(fixture)
-    # NS seulement : on exclut TBD, live, terminé, reporté et annulé.
     return status == "NS" and kickoff is not None and kickoff > now_local()
 
 
 # ------------------------- API -----------------------------
 
 def api_get(endpoint, params=None):
-    """Appel API avec détails utiles en cas d'erreur HTTP ou JSON."""
     if not API_KEY:
         raise RuntimeError("Clé API-Football absente.")
     response = requests.get(
@@ -116,14 +117,14 @@ def api_get(endpoint, params=None):
         except ValueError:
             detail = response.text[:300]
         raise RuntimeError(
-            f"API-Football HTTP {response.status_code}: {str(detail)[:300]}"
+            f"API-Football HTTP {response.status_code}: {str(detail)[:250]}"
         ) from exc
     try:
         data = response.json()
     except ValueError as exc:
         raise RuntimeError("Réponse API-Football invalide : JSON illisible.") from exc
     if data.get("errors"):
-        raise RuntimeError(f"Erreur API-Football : {str(data['errors'])[:300]}")
+        raise RuntimeError(f"Erreur API-Football : {str(data['errors'])[:250]}")
     return data
 
 
@@ -184,6 +185,7 @@ def parse_percent(value):
 
 
 def spread_fixtures(fixtures, count):
+    """Échantillonnage réparti sur les horaires, sans prétendre classer les matchs."""
     if count <= 0:
         return []
     if len(fixtures) <= count:
@@ -199,7 +201,67 @@ def spread_fixtures(fixtures, count):
     return output
 
 
-# ------------------- Analyse des marchés -------------------
+# --------------- Comparaison premium API ------------------
+
+COMPARISON_LABELS = {
+    "form": "forme",
+    "att": "attaque",
+    "def": "défense",
+    "poisson_distribution": "Poisson",
+    "goals": "buts",
+    "h2h": "confrontations",
+}
+
+
+def comparison_quality(prediction_data, side):
+    """
+    Calcule un indice interne à partir des comparaisons API.
+    side = home ou away. Ce score n'est PAS une probabilité de victoire.
+    """
+    comparison = prediction_data.get("comparison", {})
+    if not isinstance(comparison, dict):
+        return None, [], []
+
+    values = []
+    details = []
+    favorable = 0
+
+    # Le face-à-face est moins déterminant que la forme et les statistiques.
+    weights = {
+        "form": 1.25,
+        "att": 1.0,
+        "def": 1.0,
+        "poisson_distribution": 1.25,
+        "goals": 1.0,
+        "h2h": 0.65,
+    }
+
+    for key, label in COMPARISON_LABELS.items():
+        block = comparison.get(key)
+        if not isinstance(block, dict):
+            continue
+        own = parse_percent(block.get(side))
+        opponent = parse_percent(block.get("away" if side == "home" else "home"))
+        if own is None or opponent is None:
+            continue
+
+        weight = weights.get(key, 1.0)
+        values.append((own, weight))
+        if own > opponent:
+            favorable += 1
+        details.append(f"{label}: {own:.0f}-{opponent:.0f}")
+
+    if len(values) < MIN_COMPARISON_METRICS:
+        return None, details, []
+
+    weighted_score = sum(value * weight for value, weight in values) / sum(
+        weight for _, weight in values
+    )
+    # Petite pénalité si la comparaison ne penche pas assez vers le côté choisi.
+    support_ratio = favorable / len(values)
+    quality = (weighted_score * 0.75) + (support_ratio * 100 * 0.25)
+    return round(quality, 1), details, values
+
 
 def extract_markets(prediction_data):
     predictions = prediction_data.get("predictions", {})
@@ -220,39 +282,44 @@ def extract_markets(prediction_data):
     if not MIN_1X2_SUM <= total <= MAX_1X2_SUM:
         return {"markets": [], "reason": f"Somme 1N2 incohérente ({total:.1f}%)"}
 
-    markets = []
+    candidates = []
     if MIN_WIN_PERCENT <= home <= MAX_ACCEPTED_PERCENT:
-        markets.append({
-            "market": "Victoire domicile", "selection": "1",
-            "percent": home, "type": "victoire",
-        })
+        candidates.append(("1", "Victoire domicile", home, "home", "victoire"))
     if MIN_WIN_PERCENT <= away <= MAX_ACCEPTED_PERCENT:
-        markets.append({
-            "market": "Victoire extérieure", "selection": "2",
-            "percent": away, "type": "victoire",
-        })
+        candidates.append(("2", "Victoire extérieure", away, "away", "victoire"))
 
-    # Double chance calculée à partir des estimations 1N2 de l'API.
-    # Ce calcul n'est pas une probabilité indépendante ni un taux historique.
     double_chances = [
-        ("1X", home + draw),
-        ("X2", away + draw),
-        ("12", home + away),
+        ("1X", home + draw, "home"),
+        ("X2", away + draw, "away"),
     ]
-    for selection, value in double_chances:
+    for selection, value, side in double_chances:
         value = min(100.0, value)
         if MIN_DOUBLE_CHANCE_PERCENT <= value <= MAX_ACCEPTED_PERCENT:
-            markets.append({
-                "market": "Double chance", "selection": selection,
-                "percent": value, "type": "double",
-            })
+            candidates.append((selection, "Double chance", value, side, "double"))
 
-    # L'API fournit souvent un conseil de buts sans probabilité chiffrée.
-    # On ne fabrique donc aucun pourcentage Over/Under.
-    markets.sort(key=lambda item: item["percent"], reverse=True)
+    markets = []
+    rejected = []
+    for selection, label, estimate, side, market_type in candidates:
+        quality, details, _ = comparison_quality(prediction_data, side)
+        if quality is None:
+            rejected.append(f"{selection}: comparaison insuffisante")
+            continue
+        if quality < MIN_QUALITY_SCORE:
+            rejected.append(f"{selection}: indice qualité {quality:.1f}/100 trop faible")
+            continue
+        markets.append({
+            "market": label,
+            "selection": selection,
+            "percent": estimate,
+            "type": market_type,
+            "quality": quality,
+            "comparison_details": details,
+        })
+
+    markets.sort(key=lambda item: (item["quality"], item["percent"]), reverse=True)
     return {
         "markets": markets,
-        "reason": None,
+        "reason": "; ".join(rejected[:3]) if not markets and rejected else None,
         "home_percent": home,
         "draw_percent": draw,
         "away_percent": away,
@@ -279,6 +346,7 @@ def load_store():
 
 
 def save_store(data):
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     temp_file = DATA_FILE.with_suffix(".tmp")
     with temp_file.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, indent=2)
@@ -306,6 +374,7 @@ def register_picks(picks):
             "selection": pick["selection"],
             "market_type": pick["market_type"],
             "estimated_percent": pick["percent"],
+            "quality_score": pick["quality"],
             "created_at": now_local().isoformat(),
             "result": "pending",
             "score": None,
@@ -321,8 +390,16 @@ def settle_pick(pick, fixture):
     if status not in ("FT", "AET", "PEN"):
         return None
 
-    goals = fixture.get("goals", {})
-    home_goals, away_goals = goals.get("home"), goals.get("away")
+    # Pour les marchés 1X2 classiques, on privilégie le score à 90 minutes.
+    score = fixture.get("score", {})
+    fulltime = score.get("fulltime") if isinstance(score, dict) else None
+    if isinstance(fulltime, dict):
+        home_goals = fulltime.get("home")
+        away_goals = fulltime.get("away")
+    else:
+        goals = fixture.get("goals", {})
+        home_goals, away_goals = goals.get("home"), goals.get("away")
+
     if not isinstance(home_goals, int) or not isinstance(away_goals, int):
         return None
 
@@ -335,8 +412,6 @@ def settle_pick(pick, fixture):
         outcome = home_goals >= away_goals
     elif selection == "X2":
         outcome = away_goals >= home_goals
-    elif selection == "12":
-        outcome = home_goals != away_goals
     else:
         return None
 
@@ -346,7 +421,6 @@ def settle_pick(pick, fixture):
 
 
 async def refresh_results():
-    """Actualise le suivi et retourne les détails des erreurs rencontrées."""
     store = load_store()
     pending = [p for p in store["picks"] if p.get("result") == "pending"]
     if not pending:
@@ -366,15 +440,11 @@ async def refresh_results():
         if parsed_date and parsed_date <= today_local:
             dates_to_check.add(parsed_date.isoformat())
 
-    updated = 0
-    checked_dates = 0
-    failed_dates = 0
+    updated = checked_dates = failed_dates = 0
     errors = []
     for match_date in sorted(dates_to_check):
         try:
-            data = await api_call(
-                "fixtures", {"date": match_date, "timezone": TIMEZONE}
-            )
+            data = await api_call("fixtures", {"date": match_date, "timezone": TIMEZONE})
             checked_dates += 1
             fixtures = get_response_list(data)
             by_id = {
@@ -388,15 +458,14 @@ async def refresh_results():
                     updated += 1
         except Exception as error:
             failed_dates += 1
-            detail = f"{match_date}: {str(error)[:220]}"
-            errors.append(detail)
+            errors.append(f"{match_date}: {str(error)[:200]}")
             logger.exception("Erreur actualisation bilan pour %s", match_date)
 
     save_store(store)
     return store, updated, checked_dates, failed_dates, errors
 
 
-# ---------------------- Moteur 3.4 -------------------------
+# ---------------------- Moteur premium ----------------------
 
 async def analyze_all_matches():
     current_date = today()
@@ -409,11 +478,9 @@ async def analyze_all_matches():
 
     status_data = await api_call("status")
     current, limit = get_status_info(status_data)
-
-    fixtures_data = await api_call(
-        "fixtures", {"date": current_date, "timezone": TIMEZONE}
-    )
+    fixtures_data = await api_call("fixtures", {"date": current_date, "timezone": TIMEZONE})
     fixtures = get_response_list(fixtures_data)
+
     upcoming = [f for f in fixtures if is_upcoming(f)]
     upcoming.sort(key=lambda f: f.get("fixture", {}).get("date", ""))
 
@@ -421,12 +488,12 @@ async def analyze_all_matches():
         remaining = max(0, limit - current - RESERVE_API_CALLS)
         prediction_budget = min(MAX_PREDICTION_CALLS, remaining)
     else:
-        # Budget réduit si l'API ne renvoie pas les informations de quota.
         prediction_budget = min(6, MAX_PREDICTION_CALLS)
 
     chosen_fixtures = spread_fixtures(upcoming, prediction_budget)
     candidates = []
     attempts = analyzed = no_prediction = invalid_data = api_errors = 0
+    error_details = []
 
     for fixture in chosen_fixtures:
         if not is_upcoming(fixture):
@@ -458,6 +525,8 @@ async def analyze_all_matches():
                 "market": best["market"],
                 "selection": best["selection"],
                 "percent": best["percent"],
+                "quality": best["quality"],
+                "comparison_details": best["comparison_details"],
                 "market_type": best["type"],
                 "home_percent": analysis["home_percent"],
                 "draw_percent": analysis["draw_percent"],
@@ -467,18 +536,21 @@ async def analyze_all_matches():
             })
         except Exception as error:
             api_errors += 1
+            detail = f"Match {fixture_id}: {str(error)[:170]}"
+            if len(error_details) < 5:
+                error_details.append(detail)
             logger.warning("Erreur prédiction fixture %s : %s", fixture_id, error)
 
-    # Recontrôle horaire local juste avant la sélection finale.
-    candidates.sort(key=lambda item: item["percent"], reverse=True)
+    # L'indice qualité prime sur le pourcentage API.
+    candidates.sort(key=lambda item: (item["quality"], item["percent"]), reverse=True)
     selected, used_leagues = [], set()
+    fixture_by_id = {
+        str(f.get("fixture", {}).get("id")): f for f in upcoming
+    }
     for candidate in candidates:
         if len(selected) >= MAX_DISPLAY_PICKS:
             break
-        original = next(
-            (f for f in upcoming if f.get("fixture", {}).get("id") == candidate["fixture_id"]),
-            None,
-        )
+        original = fixture_by_id.get(str(candidate["fixture_id"]))
         if not original or not is_upcoming(original):
             continue
         if ONE_PICK_PER_LEAGUE and candidate["league"] in used_leagues:
@@ -487,7 +559,6 @@ async def analyze_all_matches():
         used_leagues.add(candidate["league"])
 
     tracked = register_picks(selected) if selected else 0
-
     result = {
         "date": current_date,
         "total": len(fixtures),
@@ -497,15 +568,12 @@ async def analyze_all_matches():
         "no_prediction": no_prediction,
         "invalid_data": invalid_data,
         "api_errors": api_errors,
+        "error_details": error_details,
         "prediction_budget": prediction_budget,
         "picks": selected,
         "tracked": tracked,
     }
-    analysis_cache.update({
-        "time": time.time(),
-        "date": current_date,
-        "result": result,
-    })
+    analysis_cache.update({"time": time.time(), "date": current_date, "result": result})
     return result
 
 
@@ -526,38 +594,26 @@ async def send_long_message(update, message):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👑 BIENVENUE SUR ALEPH BET AI {VERSION} !\n\n"
-        "⚽ Analyse des matchs de football à venir.\n"
-        "📅 Dates complètes et heures de Côte d'Ivoire.\n"
+        "⚽ Analyse multi-critères des matchs à venir.\n"
+        "📊 Forme, attaque, défense, Poisson et confrontations si disponibles.\n"
         "🎯 Maximum 3 sélections, aucune sélection forcée.\n"
-        "📊 Suivi des résultats réels avec /bilan.\n"
-        "🛑 Les matchs commencés ou terminés sont exclus.\n\n"
-        "COMMANDES :\n"
-        "/matchs - Matchs à venir aujourd'hui\n"
-        "/pronostics - Analyse des meilleurs matchs\n"
-        "/bilan - Résultats des sélections suivies\n"
-        "/statut - API et quota\n"
-        "/aide - Aide\n\n"
-        "⚠️ Aucun pronostic ni pourcentage ne garantit un gain."
+        "📅 Dates complètes et heures de Côte d'Ivoire.\n"
+        "📚 Suivi des résultats réels avec /bilan.\n\n"
+        "COMMANDES : /matchs /pronostics /bilan /statut /aide\n\n"
+        "⚠️ Les estimations et indices ne garantissent aucun gain."
     )
 
 
 async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🤖 ALEPH BET AI {VERSION}\n\n"
-        "/start : Accueil\n"
-        "/matchs : Matchs à venir\n"
-        "/pronostics : Analyse approfondie\n"
-        "/bilan : Suivi des résultats\n"
+        "/start : Accueil\n/matchs : Matchs à venir aujourd'hui\n"
+        "/pronostics : Analyse premium\n/bilan : Suivi des résultats\n"
         "/statut : Connexion et quota\n\n"
-        "MARCHÉS ANALYSÉS :\n"
-        "1 : Victoire domicile\n"
-        "2 : Victoire extérieure\n"
-        "1X : Domicile ou nul\n"
-        "X2 : Extérieur ou nul\n"
-        "12 : Une des deux équipes gagne\n\n"
-        "Les estimations viennent de l'API. Elles ne sont pas "
-        "des taux de réussite historiques. Les marchés de buts "
-        "ne sont pas chiffrés si l'API ne fournit pas de probabilité."
+        "MARCHÉS : 1, 2, 1X et X2.\n"
+        "Les marchés Over/Under ne sont pas proposés sans probabilité fiable.\n\n"
+        "L'indice qualité mesure la cohérence des comparaisons API ; "
+        "ce n'est pas une probabilité de victoire ni un taux historique."
     )
 
 
@@ -578,22 +634,17 @@ async def statut(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(message)
     except Exception as error:
         logger.exception("Erreur statut")
-        await update.message.reply_text(
-            "🔴 Connexion API impossible.\n" + str(error)[:250]
-        )
+        await update.message.reply_text("🔴 Connexion API impossible.\n" + str(error)[:250])
 
 
 async def matchs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        data = await api_call(
-            "fixtures", {"date": today(), "timezone": TIMEZONE}
-        )
+        data = await api_call("fixtures", {"date": today(), "timezone": TIMEZONE})
         fixtures = [f for f in get_response_list(data) if is_upcoming(f)]
         fixtures.sort(key=lambda f: f.get("fixture", {}).get("date", ""))
         if not fixtures:
             await update.message.reply_text("⚽ Aucun match à venir aujourd'hui.")
             return
-
         lines = [
             f"⚽ MATCHS À VENIR — {now_local().strftime('%d/%m/%Y')}",
             f"Total : {len(fixtures)}", "",
@@ -608,24 +659,21 @@ async def matchs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_message(update, "\n".join(lines))
     except Exception as error:
         logger.exception("Erreur matchs")
-        await update.message.reply_text(
-            "❌ Erreur récupération matchs : " + str(error)[:250]
-        )
+        await update.message.reply_text("❌ Erreur récupération matchs : " + str(error)[:250])
 
 
 async def pronostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👑 ALEPH BET AI {VERSION}\n"
-        "🔎 Analyse des matchs à venir...\n"
-        "🛡️ Exclusion des matchs commencés ou terminés...\n"
-        "📊 Comparaison des estimations disponibles..."
+        "🔎 Analyse premium des matchs à venir...\n"
+        "📊 Comparaison forme, attaque, défense et modèle de Poisson...\n"
+        "🛡️ Filtrage des données insuffisantes..."
     )
     try:
         result = await analyze_all_matches()
         lines = [
-            f"👑 ALEPH BET AI {VERSION} — RAPPORT DU JOUR",
-            f"📅 Date : {result['date']}",
-            "",
+            f"👑 ALEPH BET AI {VERSION} — RAPPORT PREMIUM",
+            f"📅 Date : {result['date']}", "",
             f"⚽ Matchs récupérés : {result['total']}",
             f"🕒 Matchs à venir : {result['upcoming']}",
             f"🔍 Tentatives d'analyse : {result['attempts']}",
@@ -633,21 +681,24 @@ async def pronostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📭 Sans prédiction : {result['no_prediction']}",
             f"🧹 Données écartées : {result['invalid_data']}",
             f"⚠️ Erreurs API : {result['api_errors']}",
-            f"🔋 Budget d'analyse : {result['prediction_budget']} appels maximum",
-            "",
+            f"🔋 Budget d'analyse : {result['prediction_budget']} appels maximum", "",
         ]
+
+        if result["error_details"]:
+            lines.extend(["DÉTAIL DES ERREURS :"])
+            lines.extend(f"• {item}" for item in result["error_details"])
+            lines.append("")
 
         if not result["picks"]:
             lines.extend([
-                "🛑 AUCUNE SÉLECTION RETENUE",
-                "Les données disponibles ne satisfont pas les filtres.",
-                "Le robot préfère s'abstenir plutôt que forcer un pari.",
+                "🛑 AUCUNE SÉLECTION ASSEZ SOLIDE",
+                "Les données comparatives disponibles ne passent pas les filtres premium.",
+                "Le robot préfère s'abstenir plutôt que forcer un pronostic.",
             ])
         else:
             lines.extend([
-                f"🎯 {len(result['picks'])} SÉLECTION(S)",
-                "Les matchs sont à retrouver manuellement sur 1xBet.",
-                "",
+                f"🎯 {len(result['picks'])} SÉLECTION(S) RETENUE(S)",
+                "Matchs à retrouver manuellement sur 1xBet.", "",
             ])
             for index, pick in enumerate(result["picks"], 1):
                 lines.extend([
@@ -656,17 +707,18 @@ async def pronostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"⚽ {pick['match']}",
                     f"🏆 {pick['league']}",
                     f"📅 Date : {pick['date']}",
-                    f"🕒 Heure : {pick['time']} (Côte d'Ivoire)",
-                    "",
+                    f"🕒 Heure : {pick['time']} (Côte d'Ivoire)", "",
                     f"🎯 Marché : {pick['market']}",
                     f"📌 Choix : {pick['selection']}",
                     f"📈 Estimation API : {pick['percent']:.1f} %",
+                    f"🧠 Indice qualité : {pick['quality']:.1f}/100",
                     (
                         "📊 Base 1N2 API : "
                         f"1={pick['home_percent']:.1f}% | "
                         f"N={pick['draw_percent']:.1f}% | "
                         f"2={pick['away_percent']:.1f}%"
                     ),
+                    "🔬 Comparaison : " + " | ".join(pick["comparison_details"]),
                 ])
                 if pick.get("advice"):
                     lines.append(f"💡 Conseil API : {str(pick['advice'])[:180]}")
@@ -678,21 +730,19 @@ async def pronostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append("")
 
         lines.extend([
-            "━━━━━━━━━━━━━━━━",
-            "",
-            "ℹ️ Les pourcentages sont des estimations API, pas des taux de réussite.",
-            "ℹ️ Les doubles chances sont calculées depuis les estimations 1N2.",
-            "ℹ️ Aucune cote 1xBet n'est vérifiée ni garantie par le robot.",
-            "⚠️ Aucun pari n'est sûr. Mise faible et limites strictes.",
+            "━━━━━━━━━━━━━━━━", "",
+            "ℹ️ L'estimation API n'est pas un taux de réussite historique.",
+            "ℹ️ L'indice qualité est un score de cohérence, pas une probabilité.",
+            "ℹ️ L'analyse utilise les comparaisons fournies par API-Football.",
+            "ℹ️ Aucune cote ni disponibilité 1xBet n'est vérifiée.",
+            "⚠️ Aucun pari n'est sûr. Ne mise que ce que tu peux perdre.",
             f"📚 Nouvelles sélections ajoutées au suivi : {result['tracked']}",
             "Utilise /bilan pour consulter les résultats suivis.",
         ])
         await send_long_message(update, "\n".join(lines))
     except Exception as error:
         logger.exception("Erreur pronostics")
-        await update.message.reply_text(
-            "❌ Erreur pendant l'analyse.\n" + str(error)[:250]
-        )
+        await update.message.reply_text("❌ Erreur pendant l'analyse.\n" + str(error)[:250])
 
 
 async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -704,7 +754,7 @@ async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         losses = sum(1 for p in picks if p.get("result") == "loss")
         pending = sum(1 for p in picks if p.get("result") == "pending")
         settled = wins + losses
-        rate = (wins / settled * 100) if settled else None
+        rate = wins / settled * 100 if settled else None
 
         lines = [
             f"📊 ALEPH BET AI {VERSION} — BILAN",
@@ -734,18 +784,16 @@ async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{icon} {pick.get('date')} {pick.get('time')} | "
                 f"{pick.get('match')} | {pick.get('selection')}{score}"
             )
-
         lines.extend([
             "",
-            "⚠️ Ce bilan porte uniquement sur les sélections enregistrées par le bot.",
+            "⚠️ Bilan limité aux sélections enregistrées par le bot.",
             "Il ne prouve pas un bénéfice financier et ne garantit pas les prochains résultats.",
+            "⚠️ Sur Render gratuit, le fichier JSON local peut être perdu lors d'un redémarrage ou redéploiement.",
         ])
         await send_long_message(update, "\n".join(lines))
     except Exception as error:
         logger.exception("Erreur bilan")
-        await update.message.reply_text(
-            "❌ Impossible d'actualiser le bilan : " + str(error)[:250]
-        )
+        await update.message.reply_text("❌ Impossible d'actualiser le bilan : " + str(error)[:250])
 
 
 # ------------------------- Démarrage -----------------------
