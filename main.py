@@ -1,1130 +1,575 @@
-import os
-import json
-import time
-import logging
+"""
+ALEPH BET AI 5.1
+Bot Telegram multi-sports : football, basketball et hockey sur glace.
+API : DataSportsAPI v2.
+Stockage PostgreSQL si DATABASE_URL est défini, sinon fichier JSON local.
+Les indices sont heuristiques et ne sont jamais des probabilités.
+"""
+from __future__ import annotations
+
 import asyncio
-import threading
+import json
+import logging
+import os
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
-import requests
+import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-
-# ============================================================
-# ALEPH BET AI 5.0 — DATA SPORTS API — MULTI-SPORTS
-# Football + Basketball + Ice Hockey
-#
-# Les données sont analysées séparément par sport.
-# L'indice interne n'est PAS une probabilité.
-# Le plan gratuit DataSportsAPI ne fournit pas les cotes.
-# Aucun pari n'est garanti et aucune sélection n'est forcée.
-# ============================================================
-
-VERSION = "5.0 DATA SPORTS MULTI-SPORTS"
-TIMEZONE = "Africa/Abidjan"
-TZ = ZoneInfo(TIMEZONE)
-
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+VERSION = "5.1 DATA SPORTS MULTI-SPORTS"
+TZ = ZoneInfo("Africa/Abidjan")
+API_BASE = "https://api.datasportsapi.com"
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("BOT_TOKEN", "")).strip()
+API_KEY = os.getenv("DATASPORTS_API_KEY", "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
-
-DATASPORTS_API_KEY = os.getenv("DATASPORTS_API_KEY", "").strip()
-API_BASE = "https://api.datasportsapi.com"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+HISTORY_FILE = Path(os.getenv("ALEPH_DATA_FILE", "aleph_bet_history.json"))
 
 SPORTS = {
-    "football": {
-        "slug": "football",
-        "label": "⚽ FOOTBALL",
-    },
-    "basketball": {
-        "slug": "basketball",
-        "label": "🏀 BASKETBALL",
-    },
-    "hockey": {
-        "slug": "ice-hockey",
-        "label": "🏒 HOCKEY SUR GLACE",
-    },
+    "football": {"slug": "football", "label": "⚽ FOOTBALL"},
+    "basketball": {"slug": "basketball", "label": "🏀 BASKETBALL"},
+    "hockey": {"slug": "ice-hockey", "label": "🏒 HOCKEY SUR GLACE"},
 }
-
-# Limites prudentes pour le plan gratuit.
 CACHE_SECONDS = 900
-MIN_REQUEST_INTERVAL = 6.2  # environ 9,7 requêtes/minute au maximum
+MIN_REQUEST_INTERVAL = 6.2
 DAYS_AHEAD = 2
-MAX_FIXTURE_PAGES_PER_DAY = 2
-MAX_ANALYSIS_CANDIDATES = 3
+MAX_PAGES_PER_DAY = 3
+MAX_CANDIDATES = 5
 MAX_PICKS_PER_SPORT = 2
-MAX_RESULT_CHECKS_PER_BILAN = 5
+MAX_RESULT_CHECKS = 5
 MIN_KICKOFF_MARGIN_MINUTES = 30
-
-# Le fichier est local au service Render. Sur le plan gratuit, le système
-# de fichiers peut être réinitialisé lors d'un redémarrage/redéploiement.
-HISTORY_FILE = Path(
-    os.getenv("ALEPH_DATA_FILE", "aleph_bet_history.json")
-)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("aleph-bet-ai")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-CACHE = {}
-CACHE_LOCK = threading.Lock()
-RATE_LOCK = threading.Lock()
-LAST_REQUEST_AT = 0.0
+_cache: dict[tuple, tuple[float, Any]] = {}
+_cache_lock = asyncio.Lock()
+_api_lock = asyncio.Lock()
+_last_request = 0.0
 
 
-# ------------------------- Horloge -------------------------
-
-def now_local():
+def now_local() -> datetime:
     return datetime.now(TZ)
 
 
-def date_local(offset=0):
-    # Côte d'Ivoire est en UTC : la date locale correspond à la date UTC.
+def local_date(offset: int = 0) -> str:
     return (now_local().date() + timedelta(days=offset)).isoformat()
 
 
-def parse_datetime(value):
+def parse_dt(value: Any) -> datetime | None:
     if not value:
         return None
     try:
         dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(TZ)
     except (ValueError, TypeError):
         return None
 
 
-def format_datetime(value):
-    dt = parse_datetime(value)
-    return dt.strftime("%d/%m/%Y à %H:%M") if dt else "Date non disponible"
+def fmt_dt(value: Any) -> str:
+    dt = parse_dt(value)
+    return dt.strftime("%d/%m/%Y à %H:%M") if dt else "Date indisponible"
 
 
-# ------------------------- API DataSportsAPI -------------------------
+async def api_get(path: str, params: dict | None = None) -> dict:
+    global _last_request
+    if not API_KEY:
+        raise RuntimeError("DATASPORTS_API_KEY absente dans Render.")
+    async with _api_lock:
+        delay = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        _last_request = time.monotonic()
 
-def wait_for_api_slot():
-    """Respecte la limite de 10 requêtes/minute du compte gratuit."""
-    global LAST_REQUEST_AT
-    with RATE_LOCK:
-        elapsed = time.monotonic() - LAST_REQUEST_AT
-        wait_seconds = MIN_REQUEST_INTERVAL - elapsed
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
-        LAST_REQUEST_AT = time.monotonic()
-
-
-def api_get(path, params=None):
-    if not DATASPORTS_API_KEY:
-        raise RuntimeError(
-            "Variable DATASPORTS_API_KEY absente dans Render."
-        )
-
-    wait_for_api_slot()
-
-    url = API_BASE + path
-    headers = {
-        "Authorization": f"Bearer {DATASPORTS_API_KEY}",
-        "Accept": "application/json",
-    }
-
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params or {},
-            timeout=25,
-        )
-    except requests.Timeout:
-        raise RuntimeError("DataSportsAPI ne répond pas dans le délai prévu.")
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Connexion DataSportsAPI impossible : {exc}")
+    headers = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
+    timeout = httpx.Timeout(25.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            response = await client.get(API_BASE + path, headers=headers, params=params or {})
+        except httpx.TimeoutException as exc:
+            raise RuntimeError("DataSportsAPI ne répond pas dans le délai prévu.") from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Connexion DataSportsAPI impossible : {exc}") from exc
 
     if response.status_code == 401:
-        raise RuntimeError(
-            "Clé DataSportsAPI refusée (401). Vérifie DATASPORTS_API_KEY dans Render."
-        )
+        raise RuntimeError("Clé DataSportsAPI refusée (401).")
     if response.status_code == 403:
-        raise RuntimeError(
-            "Accès refusé par DataSportsAPI (403). Vérifie le plan ou l'accès aux données."
-        )
+        raise RuntimeError("Accès refusé (403) : vérifie le plan ou les droits API.")
     if response.status_code == 404:
         raise RuntimeError("Donnée introuvable chez DataSportsAPI (404).")
     if response.status_code == 429:
-        retry_after = response.headers.get("Retry-After")
-        suffix = f" Réessaie dans {retry_after} secondes." if retry_after else " Réessaie plus tard."
-        raise RuntimeError(
-            "Limite de requêtes ou quota DataSportsAPI atteint (429)." + suffix
-        )
+        retry = response.headers.get("Retry-After")
+        raise RuntimeError("Quota ou limite API atteint (429)." + (f" Réessaie dans {retry} s." if retry else ""))
     if response.status_code >= 500:
-        raise RuntimeError(
-            f"DataSportsAPI rencontre une erreur serveur ({response.status_code})."
-        )
-
+        raise RuntimeError(f"Erreur serveur DataSportsAPI ({response.status_code}).")
     try:
         payload = response.json()
-    except ValueError:
-        raise RuntimeError("Réponse JSON DataSportsAPI illisible.")
-
+    except ValueError as exc:
+        raise RuntimeError("Réponse JSON DataSportsAPI illisible.") from exc
     if response.status_code >= 400:
-        detail = payload.get("errors") or payload.get("error") or "Erreur API"
-        raise RuntimeError(f"DataSportsAPI HTTP {response.status_code}: {str(detail)[:180]}")
-
-    errors = payload.get("errors")
-    if errors:
-        raise RuntimeError(f"Erreur DataSportsAPI : {str(errors)[:220]}")
-
+        raise RuntimeError(f"DataSportsAPI HTTP {response.status_code}: {str(payload)[:180]}")
+    if isinstance(payload, dict) and payload.get("errors"):
+        raise RuntimeError(f"Erreur DataSportsAPI : {str(payload['errors'])[:180]}")
+    if not isinstance(payload, dict):
+        raise RuntimeError("Format de réponse DataSportsAPI inattendu.")
     return payload
 
 
-async def cached_api_get(path, params=None):
+async def cached_get(path: str, params: dict | None = None) -> dict:
     params = params or {}
-    cache_key = (
-        path,
-        tuple(sorted((str(key), str(value)) for key, value in params.items())),
-    )
-
-    with CACHE_LOCK:
-        saved = CACHE.get(cache_key)
+    key = (path, tuple(sorted((str(k), str(v)) for k, v in params.items())))
+    async with _cache_lock:
+        saved = _cache.get(key)
         if saved and time.monotonic() - saved[0] < CACHE_SECONDS:
             return saved[1]
-
-    payload = await asyncio.to_thread(api_get, path, params)
-
-    with CACHE_LOCK:
-        CACHE[cache_key] = (time.monotonic(), payload)
-
-    return payload
+    data = await api_get(path, params)
+    async with _cache_lock:
+        _cache[key] = (time.monotonic(), data)
+    return data
 
 
-def payload_data(payload, default=None):
-    if not isinstance(payload, dict):
-        return default
+def data_of(payload: dict, default=None):
     return payload.get("data", default)
 
 
-# ------------------------- Lecture des matchs -------------------------
-
-def fixture_status(fixture):
+def status_of(fixture: dict) -> str:
     status = fixture.get("status")
-    if not isinstance(status, dict):
-        return ""
-    return str(status.get("type") or "").lower()
+    return str(status.get("type") or "").lower() if isinstance(status, dict) else ""
 
 
-def fixture_home(fixture):
-    side = fixture.get("home")
-    return side if isinstance(side, dict) else {}
+def side_of(fixture: dict, side: str) -> dict:
+    value = fixture.get(side)
+    return value if isinstance(value, dict) else {}
 
 
-def fixture_away(fixture):
-    side = fixture.get("away")
-    return side if isinstance(side, dict) else {}
-
-
-def team_name(side):
+def team_name(side: dict) -> str:
     return str(side.get("name") or "Équipe inconnue")
 
 
-def fixture_names(fixture):
-    return team_name(fixture_home(fixture)), team_name(fixture_away(fixture))
+def fixture_names(fixture: dict) -> tuple[str, str]:
+    return team_name(side_of(fixture, "home")), team_name(side_of(fixture, "away"))
 
 
-def fixture_league(fixture):
+def league_name(fixture: dict) -> str:
     league = fixture.get("league")
-    if isinstance(league, dict):
-        return str(league.get("name") or "Compétition non précisée")
-    return "Compétition non précisée"
+    return str(league.get("name") or "Compétition non précisée") if isinstance(league, dict) else "Compétition non précisée"
 
 
-def fixture_is_eligible(fixture):
-    if not isinstance(fixture, dict):
+def eligible(fixture: dict) -> bool:
+    if not isinstance(fixture, dict) or status_of(fixture) != "notstarted":
         return False
-
-    # Seuls les matchs explicitement pas encore commencés sont acceptés.
-    if fixture_status(fixture) != "notstarted":
+    kickoff = parse_dt(fixture.get("startTime"))
+    if not kickoff or kickoff <= now_local() + timedelta(minutes=MIN_KICKOFF_MARGIN_MINUTES):
         return False
-
-    kickoff = parse_datetime(fixture.get("startTime"))
-    if kickoff is None:
-        return False
-
-    cutoff = now_local() + timedelta(minutes=MIN_KICKOFF_MARGIN_MINUTES)
-    if kickoff <= cutoff:
-        return False
-
     home, away = fixture_names(fixture)
-    if home == "Équipe inconnue" or away == "Équipe inconnue":
-        return False
-
-    if not fixture.get("id"):
-        return False
-
-    return True
+    return bool(fixture.get("id")) and home != "Équipe inconnue" and away != "Équipe inconnue"
 
 
-def fixture_level_priority(fixture):
-    levels = fixture.get("levels") or []
-    labels = []
-
-    for item in levels:
-        if isinstance(item, str):
-            labels.append(item.lower())
-        elif isinstance(item, dict):
-            labels.extend(str(value).lower() for value in item.values())
-
-    if any("topcompetition" in value for value in labels):
-        return 0
-    if any(value == "pro" or value.endswith(":pro") for value in labels):
-        return 1
-    return 2
-
-
-async def get_upcoming_fixtures(sport_key):
-    config = SPORTS[sport_key]
-    slug = config["slug"]
-    fixtures_by_id = {}
-    partial_coverage = False
-
+async def upcoming(sport: str) -> tuple[list[dict], bool]:
+    found: dict[str, dict] = {}
+    partial = False
+    slug = SPORTS[sport]["slug"]
     for day_offset in range(DAYS_AHEAD):
-        day = date_local(day_offset)
-
-        for page in range(MAX_FIXTURE_PAGES_PER_DAY):
-            payload = await cached_api_get(
-                "/v2/fixtures",
-                {"date": day, "sport": slug, "page": page},
-            )
-
-            rows = payload_data(payload, [])
+        for page in range(MAX_PAGES_PER_DAY):
+            payload = await cached_get("/v2/fixtures", {
+                "date": local_date(day_offset), "sport": slug, "page": page
+            })
+            rows = data_of(payload, [])
             if isinstance(rows, list):
-                for fixture in rows:
-                    if isinstance(fixture, dict) and fixture.get("id"):
-                        fixtures_by_id[str(fixture["id"])] = fixture
-
-            meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+                for row in rows:
+                    if isinstance(row, dict) and row.get("id") is not None:
+                        found[str(row["id"])] = row
+            meta = payload.get("meta") or {}
             if isinstance(meta, dict) and meta.get("complete") is False:
-                partial_coverage = True
-
-            has_next = bool(meta.get("hasNextPage")) if isinstance(meta, dict) else False
-            if not has_next:
+                partial = True
+            if not isinstance(meta, dict) or not meta.get("hasNextPage"):
                 break
-
-            if page == MAX_FIXTURE_PAGES_PER_DAY - 1:
-                partial_coverage = True
-
-    eligible = [
-        fixture
-        for fixture in fixtures_by_id.values()
-        if fixture_is_eligible(fixture)
-    ]
-
-    eligible.sort(
-        key=lambda item: (
-            fixture_level_priority(item),
-            parse_datetime(item.get("startTime")) or now_local(),
-        )
-    )
-
-    return eligible, partial_coverage
+            if page == MAX_PAGES_PER_DAY - 1:
+                partial = True
+    matches = [x for x in found.values() if eligible(x)]
+    matches.sort(key=lambda x: parse_dt(x.get("startTime")) or now_local())
+    return matches, partial
 
 
-# ------------------------- Analyse sportive -------------------------
-
-def normalize_result(value):
+def normalize_result(value: Any) -> str | None:
     value = str(value or "").strip().lower()
-
-    if value in {"win", "won", "w", "victory"}:
-        return "win"
-    if value in {"draw", "tie", "d", "drawn"}:
-        return "draw"
-    if value in {"loss", "lost", "l", "defeat"}:
-        return "loss"
-
+    if value in {"win", "won", "w", "victory"}: return "win"
+    if value in {"draw", "tie", "d", "drawn"}: return "draw"
+    if value in {"loss", "lost", "l", "defeat"}: return "loss"
     return None
 
 
-def extract_results(team_form_rows, competition_results):
+def extract_results(rows: Any, fallback: Any) -> list[str]:
     results = []
-
-    if isinstance(team_form_rows, list):
-        for row in team_form_rows:
-            if isinstance(row, dict):
-                result = normalize_result(row.get("result"))
-                if result:
-                    results.append(result)
-
+    if isinstance(rows, list):
+        results = [r for row in rows if isinstance(row, dict)
+                   if (r := normalize_result(row.get("result")))]
     if len(results) >= 3:
         return results[-5:]
-
-    fallback = []
-    if isinstance(competition_results, list):
-        for value in competition_results:
-            result = normalize_result(value)
-            if result:
-                fallback.append(result)
-
-    return (fallback or results)[-5:]
+    backup = [r for value in fallback if (r := normalize_result(value))] if isinstance(fallback, list) else []
+    return (backup or results)[-5:]
 
 
-def form_rate(results):
+def form_rate(results: list[str]) -> float | None:
     if not results:
         return None
-
-    points = {
-        "win": 1.0,
-        "draw": 0.5,
-        "loss": 0.0,
-    }
-    return sum(points[item] for item in results) / len(results)
+    return sum({"win": 1.0, "draw": 0.5, "loss": 0.0}[x] for x in results) / len(results)
 
 
-def form_text(results):
-    symbols = {
-        "win": "V",
-        "draw": "N",
-        "loss": "D",
-    }
-    return "-".join(symbols[item] for item in results) if results else "indisponible"
-
-
-def safe_number(value):
+def number(value: Any) -> float | None:
     try:
-        if value is None or isinstance(value, bool):
-            return None
+        if value is None or isinstance(value, bool): return None
         return float(value)
-    except (ValueError, TypeError):
+    except (TypeError, ValueError):
         return None
 
 
-def average_recent_goals(home_rows, away_rows):
-    totals = []
-
-    for rows in (home_rows, away_rows):
-        if not isinstance(rows, list):
-            continue
-
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            scored = safe_number(row.get("scoreFor"))
-            conceded = safe_number(row.get("scoreAgainst"))
-            if scored is not None and conceded is not None:
-                totals.append(scored + conceded)
-
-    return (sum(totals) / len(totals)) if totals else None
-
-
-def clamp(value, low, high):
+def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-async def analyze_fixture(sport_key, fixture):
-    fixture_id = fixture.get("id")
-
+async def analyze(sport: str, fixture: dict) -> dict | None:
+    fid = fixture["id"]
     try:
-        form_payload = await cached_api_get(
-            f"/v2/fixtures/{fixture_id}/form"
-        )
-        team_form_payload = await cached_api_get(
-            f"/v2/fixtures/{fixture_id}/team-form"
-        )
+        form_payload = await cached_get(f"/v2/fixtures/{fid}/form")
+        team_payload = await cached_get(f"/v2/fixtures/{fid}/team-form")
     except Exception as exc:
-        log.warning("Données de forme indisponibles pour %s : %s", fixture_id, exc)
+        log.info("Forme indisponible pour %s : %s", fid, exc)
         return None
 
-    form_data = payload_data(form_payload, {})
-    team_data = payload_data(team_form_payload, {})
-
-    if not isinstance(form_data, dict):
-        form_data = {}
-    if not isinstance(team_data, dict):
-        team_data = {}
-
-    home_form_data = form_data.get("home") or {}
-    away_form_data = form_data.get("away") or {}
-    if not isinstance(home_form_data, dict):
-        home_form_data = {}
-    if not isinstance(away_form_data, dict):
-        away_form_data = {}
-
-    home_rows = team_data.get("home") or []
-    away_rows = team_data.get("away") or []
-
-    home_results = extract_results(
-        home_rows,
-        home_form_data.get("results", []),
-    )
-    away_results = extract_results(
-        away_rows,
-        away_form_data.get("results", []),
-    )
-
-    # Pas de sélection si l'API ne fournit pas assez d'historique des deux côtés.
-    if len(home_results) < 3 or len(away_results) < 3:
+    form = data_of(form_payload, {})
+    team = data_of(team_payload, {})
+    form = form if isinstance(form, dict) else {}
+    team = team if isinstance(team, dict) else {}
+    hf = form.get("home") if isinstance(form.get("home"), dict) else {}
+    af = form.get("away") if isinstance(form.get("away"), dict) else {}
+    hr = extract_results(team.get("home"), hf.get("results", []))
+    ar = extract_results(team.get("away"), af.get("results", []))
+    if len(hr) < 3 or len(ar) < 3:
         return None
 
-    home_rate = form_rate(home_results)
-    away_rate = form_rate(away_results)
-    if home_rate is None or away_rate is None:
+    hrate, arate = form_rate(hr), form_rate(ar)
+    if hrate is None or arate is None:
         return None
 
-    h2h_data = {}
+    h2h = {}
     try:
-        h2h_payload = await cached_api_get(
-            f"/v2/fixtures/{fixture_id}/h2h"
-        )
-        raw_h2h = payload_data(h2h_payload, {})
-        if isinstance(raw_h2h, dict):
-            h2h_data = raw_h2h
-    except Exception as exc:
-        # Le face-à-face reste facultatif : l'analyse peut continuer sans lui.
-        log.info("H2H indisponible pour %s : %s", fixture_id, exc)
+        raw = data_of(await cached_get(f"/v2/fixtures/{fid}/h2h"), {})
+        if isinstance(raw, dict): h2h = raw
+    except Exception:
+        pass
+    hw, draws, aw = (number(h2h.get(k)) or 0.0 for k in ("homeWins", "draws", "awayWins"))
+    total = hw + draws + aw
+    h2h_edge = (hw - aw) / total if total else 0.0
 
-    h2h_home = safe_number(h2h_data.get("homeWins")) or 0.0
-    h2h_draws = safe_number(h2h_data.get("draws")) or 0.0
-    h2h_away = safe_number(h2h_data.get("awayWins")) or 0.0
-    h2h_total = h2h_home + h2h_draws + h2h_away
-    h2h_edge = (
-        (h2h_home - h2h_away) / h2h_total
-        if h2h_total > 0
-        else 0.0
-    )
-
-    home_position = safe_number(home_form_data.get("position"))
-    away_position = safe_number(away_form_data.get("position"))
+    hp, ap = number(hf.get("position")), number(af.get("position"))
     position_edge = 0.0
-    if (
-        home_position is not None
-        and away_position is not None
-        and home_position > 0
-        and away_position > 0
-    ):
-        position_edge = clamp(
-            (away_position - home_position) / max(home_position, away_position, 10.0),
-            -1.0,
-            1.0,
-        )
+    if hp and ap and hp > 0 and ap > 0:
+        position_edge = clamp((ap - hp) / max(hp, ap, 10.0), -1.0, 1.0)
+    hrating, arating = number(hf.get("avgRating")), number(af.get("avgRating"))
+    rating_edge = clamp((hrating - arating) / 2.0, -1.0, 1.0) if hrating is not None and arating is not None else 0.0
 
-    home_rating = safe_number(home_form_data.get("avgRating"))
-    away_rating = safe_number(away_form_data.get("avgRating"))
-    rating_edge = 0.0
-    if home_rating is not None and away_rating is not None:
-        rating_edge = clamp((home_rating - away_rating) / 2.0, -1.0, 1.0)
+    score = round(clamp(50 + 30 * (hrate - arate) + 10 * h2h_edge + 6 * position_edge + 4 * rating_edge + 4, 0, 100))
+    home, away = fixture_names(fixture)
+    market = selection = side = None
+    quality = abs(score - 50)
 
-    # Indice de cohérence interne, jamais une probabilité.
-    form_edge = home_rate - away_rate
-    internal_score = round(
-        clamp(
-            50
-            + 30 * form_edge
-            + 10 * h2h_edge
-            + 6 * position_edge
-            + 4 * rating_edge
-            + 4,  # léger avantage du terrain
-            0,
-            100,
-        )
-    )
-
-    home_name, away_name = fixture_names(fixture)
-    league = fixture_league(fixture)
-    kickoff = fixture.get("startTime")
-
-    goal_average = average_recent_goals(home_rows, away_rows)
-    market = None
-    selection_side = None
-    selection = None
-    quality_rank = abs(internal_score - 50)
-
-    if sport_key == "football":
-        if internal_score >= 70:
-            market = "Victoire de l'équipe à domicile (1)"
-            selection_side = "home"
-            selection = home_name
-        elif internal_score <= 30:
-            market = "Victoire de l'équipe à l'extérieur (2)"
-            selection_side = "away"
-            selection = away_name
-        elif internal_score >= 62:
-            market = "Double chance 1X"
-            selection_side = "home_or_draw"
-            selection = f"{home_name} ou nul"
-        elif internal_score <= 38:
-            market = "Double chance X2"
-            selection_side = "away_or_draw"
-            selection = f"{away_name} ou nul"
-        elif goal_average is not None and goal_average >= 3.0:
-            market = "Plus de 2,5 buts"
-            selection_side = "over_2_5"
-            selection = "Plus de 2,5 buts"
-            quality_rank = abs(goal_average - 2.5) * 20
-        elif goal_average is not None and goal_average <= 2.0:
-            market = "Moins de 2,5 buts"
-            selection_side = "under_2_5"
-            selection = "Moins de 2,5 buts"
-            quality_rank = abs(goal_average - 2.5) * 20
+    if sport == "football":
+        if score >= 70: market, selection, side = "Victoire domicile (1)", home, "home"
+        elif score <= 30: market, selection, side = "Victoire extérieur (2)", away, "away"
+        elif score >= 62: market, selection, side = "Double chance 1X", f"{home} ou nul", "home_or_draw"
+        elif score <= 38: market, selection, side = "Double chance X2", f"{away} ou nul", "away_or_draw"
     else:
-        if internal_score >= 68:
-            market = "Victoire de l'équipe à domicile"
-            selection_side = "home"
-            selection = home_name
-        elif internal_score <= 32:
-            market = "Victoire de l'équipe à l'extérieur"
-            selection_side = "away"
-            selection = away_name
+        if score >= 68: market, selection, side = "Victoire domicile", home, "home"
+        elif score <= 32: market, selection, side = "Victoire extérieur", away, "away"
 
     if not market:
         return None
-
-    h2h_text = (
-        f"{int(h2h_home)} victoire(s) domicile, "
-        f"{int(h2h_draws)} nul(s), {int(h2h_away)} victoire(s) extérieur"
-        if h2h_total > 0
-        else "face-à-face non disponible"
-    )
-
-    reason = (
-        f"Forme récente : {home_name} {form_text(home_results)} "
-        f"({len(home_results)} matchs) / {away_name} {form_text(away_results)} "
-        f"({len(away_results)} matchs). {h2h_text}."
-    )
-
-    if goal_average is not None and sport_key == "football":
-        reason += f" Moyenne de buts observée sur les derniers matchs : {goal_average:.2f}."
-
+    symbols = {"win": "V", "draw": "N", "loss": "D"}
+    reason = (f"Forme récente : {home} {'-'.join(symbols[x] for x in hr)} / "
+              f"{away} {'-'.join(symbols[x] for x in ar)}. "
+              f"Face-à-face : {int(hw)} victoire(s) domicile, {int(draws)} nul(s), {int(aw)} victoire(s) extérieur."
+              if total else f"Forme récente : {home} {'-'.join(symbols[x] for x in hr)} / {away} {'-'.join(symbols[x] for x in ar)}. Face-à-face indisponible.")
     return {
-        "sport": sport_key,
-        "fixture_id": int(fixture_id),
-        "home": home_name,
-        "away": away_name,
-        "league": league,
-        "start_time": kickoff,
-        "market": market,
-        "selection": selection,
-        "selection_side": selection_side,
-        "internal_score": int(internal_score),
-        "reason": reason,
-        "quality_rank": float(quality_rank),
-        "outcome": "pending",
-        "recorded_at": now_local().isoformat(),
+        "sport": sport, "fixture_id": str(fid), "home": home, "away": away,
+        "league": league_name(fixture), "start_time": fixture.get("startTime"),
+        "market": market, "selection": selection, "selection_side": side,
+        "internal_score": score, "quality_rank": quality, "reason": reason,
+        "outcome": "pending", "recorded_at": now_local().isoformat()
     }
 
 
-# ------------------------- Historique et bilan -------------------------
-
-def load_history():
-    try:
-        if not HISTORY_FILE.exists():
+def load_history() -> list[dict]:
+    if DATABASE_URL:
+        try:
+            import psycopg
+            with psycopg.connect(DATABASE_URL) as conn:
+                conn.execute("""CREATE TABLE IF NOT EXISTS aleph_picks (
+                    id BIGSERIAL PRIMARY KEY, fixture_id TEXT NOT NULL, sport TEXT NOT NULL,
+                    selection_side TEXT NOT NULL, payload JSONB NOT NULL,
+                    UNIQUE(fixture_id, sport, selection_side))""")
+                rows = conn.execute("SELECT payload FROM aleph_picks ORDER BY id").fetchall()
+                return [row[0] for row in rows]
+        except Exception as exc:
+            log.error("PostgreSQL indisponible : %s", exc)
             return []
-        with HISTORY_FILE.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Historique illisible : %s", exc)
-        return []
-
-
-def save_history(history):
     try:
-        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temporary = HISTORY_FILE.with_suffix(HISTORY_FILE.suffix + ".tmp")
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(history, handle, ensure_ascii=False, indent=2)
-        os.replace(temporary, HISTORY_FILE)
-        return True
-    except OSError as exc:
-        log.error("Impossible d'enregistrer l'historique : %s", exc)
-        return False
+        if HISTORY_FILE.exists():
+            content = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            return content if isinstance(content, list) else []
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Historique JSON illisible : %s", exc)
+    return []
 
 
-def record_picks(picks):
-    if not picks:
+def save_pick(pick: dict) -> None:
+    if DATABASE_URL:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS aleph_picks (
+                id BIGSERIAL PRIMARY KEY, fixture_id TEXT NOT NULL, sport TEXT NOT NULL,
+                selection_side TEXT NOT NULL, payload JSONB NOT NULL,
+                UNIQUE(fixture_id, sport, selection_side))""")
+            conn.execute("""INSERT INTO aleph_picks (fixture_id,sport,selection_side,payload)
+                VALUES (%s,%s,%s,%s) ON CONFLICT (fixture_id,sport,selection_side) DO NOTHING""",
+                (pick["fixture_id"], pick["sport"], pick["selection_side"], json.dumps(pick)))
         return
-
     history = load_history()
-    known = {
-        (str(item.get("sport")), str(item.get("fixture_id")), str(item.get("selection_side")))
-        for item in history
-        if isinstance(item, dict)
-    }
-
-    changed = False
-    for pick in picks:
-        key = (
-            str(pick.get("sport")),
-            str(pick.get("fixture_id")),
-            str(pick.get("selection_side")),
-        )
-        if key in known:
-            continue
+    key = (str(pick["fixture_id"]), pick["sport"], pick["selection_side"])
+    if not any((str(x.get("fixture_id")), x.get("sport"), x.get("selection_side")) == key for x in history):
         history.append(pick)
-        known.add(key)
-        changed = True
-
-    if changed:
-        save_history(history)
-
-
-def winner_from_fixture(fixture):
-    winner = fixture.get("winner")
-    if winner in {"home", "away", "draw"}:
-        return winner
-
-    home_score = fixture.get("homeScore")
-    away_score = fixture.get("awayScore")
-    home_score = home_score.get("current") if isinstance(home_score, dict) else None
-    away_score = away_score.get("current") if isinstance(away_score, dict) else None
-
-    home_score = safe_number(home_score)
-    away_score = safe_number(away_score)
-
-    if home_score is None or away_score is None:
-        return None
-    if home_score > away_score:
-        return "home"
-    if away_score > home_score:
-        return "away"
-    return "draw"
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = HISTORY_FILE.with_suffix(HISTORY_FILE.suffix + ".tmp")
+        temp.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, HISTORY_FILE)
 
 
-def evaluate_pick(pick, fixture):
+def update_pick(pick: dict) -> None:
+    if DATABASE_URL:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute("""UPDATE aleph_picks SET payload=%s
+                WHERE fixture_id=%s AND sport=%s AND selection_side=%s""",
+                (json.dumps(pick), pick["fixture_id"], pick["sport"], pick["selection_side"]))
+        return
+    history = load_history()
+    for i, old in enumerate(history):
+        if (str(old.get("fixture_id")), old.get("sport"), old.get("selection_side")) == (str(pick.get("fixture_id")), pick.get("sport"), pick.get("selection_side")):
+            history[i] = pick
+    HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def winner(fixture: dict) -> str | None:
+    value = fixture.get("winner")
+    if value in {"home", "away", "draw"}: return value
+    hs, aws = fixture.get("homeScore"), fixture.get("awayScore")
+    hs = hs.get("current") if isinstance(hs, dict) else hs
+    aws = aws.get("current") if isinstance(aws, dict) else aws
+    hs, aws = number(hs), number(aws)
+    if hs is None or aws is None: return None
+    return "home" if hs > aws else "away" if aws > hs else "draw"
+
+
+def settle(pick: dict, fixture: dict) -> str | None:
+    result = winner(fixture)
+    if result is None: return None
     side = pick.get("selection_side")
-
-    if side == "over_2_5" or side == "under_2_5":
-        home_score = fixture.get("homeScore")
-        away_score = fixture.get("awayScore")
-        home_score = home_score.get("current") if isinstance(home_score, dict) else None
-        away_score = away_score.get("current") if isinstance(away_score, dict) else None
-        home_score = safe_number(home_score)
-        away_score = safe_number(away_score)
-
-        if home_score is None or away_score is None:
-            return None
-
-        total_goals = home_score + away_score
-        if side == "over_2_5":
-            return "won" if total_goals > 2.5 else "lost"
-        return "won" if total_goals < 2.5 else "lost"
-
-    winner = winner_from_fixture(fixture)
-    if winner is None:
-        return None
-
-    if side == "home":
-        return "won" if winner == "home" else "lost"
-    if side == "away":
-        return "won" if winner == "away" else "lost"
-    if side == "home_or_draw":
-        return "won" if winner in {"home", "draw"} else "lost"
-    if side == "away_or_draw":
-        return "won" if winner in {"away", "draw"} else "lost"
-
+    if side == "home": return "won" if result == "home" else "lost"
+    if side == "away": return "won" if result == "away" else "lost"
+    if side == "home_or_draw": return "won" if result in {"home", "draw"} else "lost"
+    if side == "away_or_draw": return "won" if result in {"away", "draw"} else "lost"
     return None
 
 
-async def update_pending_results(history):
-    pending = []
-
+async def refresh_results(history: list[dict]) -> None:
+    count = 0
     for pick in history:
-        if not isinstance(pick, dict) or pick.get("outcome") != "pending":
-            continue
-
-        kickoff = parse_datetime(pick.get("start_time"))
-        if kickoff and kickoff + timedelta(hours=3) <= now_local():
-            pending.append(pick)
-
-    updated = False
-
-    for pick in pending[:MAX_RESULT_CHECKS_PER_BILAN]:
-        fixture_id = pick.get("fixture_id")
-        if not fixture_id:
-            continue
-
+        if count >= MAX_RESULT_CHECKS: break
+        if pick.get("outcome") != "pending": continue
+        kickoff = parse_dt(pick.get("start_time"))
+        if not kickoff or kickoff + timedelta(hours=3) > now_local(): continue
         try:
-            payload = await cached_api_get(f"/v2/fixtures/{fixture_id}")
-            fixture = payload_data(payload, {})
-            if not isinstance(fixture, dict):
-                continue
-
-            status = fixture_status(fixture)
-
-            if status in {"canceled", "cancelled"}:
+            payload = await cached_get(f"/v2/fixtures/{pick['fixture_id']}")
+            fixture = data_of(payload, {})
+            if not isinstance(fixture, dict): continue
+            state = status_of(fixture)
+            if state in {"canceled", "cancelled"}:
                 pick["outcome"] = "void"
-                pick["settled_at"] = now_local().isoformat()
-                updated = True
-                continue
-
-            if status != "finished":
-                continue
-
-            if fixture.get("awarded") is True:
-                pick["outcome"] = "void"
+            elif state == "finished":
+                pick["outcome"] = "void" if fixture.get("awarded") is True else (settle(pick, fixture) or "pending")
             else:
-                outcome = evaluate_pick(pick, fixture)
-                if outcome is None:
-                    continue
-                pick["outcome"] = outcome
-
-            pick["settled_at"] = now_local().isoformat()
-            updated = True
-
+                continue
+            if pick["outcome"] != "pending":
+                pick["settled_at"] = now_local().isoformat()
+                await asyncio.to_thread(update_pick, pick)
+                count += 1
         except Exception as exc:
-            log.info("Résultat non actualisé pour %s : %s", fixture_id, exc)
-
-    if updated:
-        save_history(history)
-
-    return updated
+            log.info("Résultat non actualisé pour %s : %s", pick.get("fixture_id"), exc)
 
 
-# ------------------------- Commandes Telegram -------------------------
+async def reply(update: Update, text: str) -> None:
+    if update.effective_message:
+        await update.effective_message.reply_text(text)
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message:
-        return
 
-    if not DATASPORTS_API_KEY:
-        await message.reply_text(
-            f"👑 ALEPH BET AI {VERSION}\n"
-            "🔴 DATASPORTS_API_KEY n'est pas configurée dans Render."
-        )
-        return
-
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        payload = await cached_api_get("/v2/sports")
-        data = payload_data(payload, [])
-        count = len(data) if isinstance(data, list) else "inconnu"
-        await message.reply_text(
-            f"👑 ALEPH BET AI {VERSION}\n"
-            "🟢 Connexion DataSportsAPI : accessible\n"
-            f"📚 Sports renvoyés par l'API : {count}\n"
-            "🔐 Clé utilisée côté serveur, jamais affichée."
-        )
+        payload = await cached_get("/v2/sports")
+        sports = data_of(payload, [])
+        count = len(sports) if isinstance(sports, list) else "inconnu"
+        await reply(update, f"👑 ALEPH BET AI {VERSION}\n🟢 DataSportsAPI accessible\n📚 Sports renvoyés : {count}\n🔐 Clé conservée côté serveur.")
     except Exception as exc:
-        await message.reply_text(
-            f"👑 ALEPH BET AI {VERSION}\n"
-            f"🔴 DataSportsAPI : {str(exc)[:300]}"
-        )
+        await reply(update, f"👑 ALEPH BET AI {VERSION}\n🔴 {str(exc)[:300]}")
 
 
-async def analysis_command(update: Update, sport_key):
-    message = update.effective_message
-    if not message:
-        return
-
-    if not DATASPORTS_API_KEY:
-        await message.reply_text(
-            "⚠️ La variable DATASPORTS_API_KEY doit être ajoutée dans Render."
-        )
-        return
-
+async def analyze_cmd(update: Update, sport: str) -> None:
     try:
-        fixtures, partial = await get_upcoming_fixtures(sport_key)
+        fixtures, partial = await upcoming(sport)
     except Exception as exc:
-        await message.reply_text(
-            f"⚠️ Impossible de récupérer les matchs {sport_key} :\n{str(exc)[:320]}"
-        )
+        await reply(update, f"⚠️ Impossible de récupérer les matchs :\n{str(exc)[:300]}")
         return
-
-    if not fixtures:
-        await message.reply_text(
-            f"{SPORTS[sport_key]['label']}\n"
-            "📭 Aucun match admissible trouvé dans les deux prochains jours.\n"
-            f"Les matchs à moins de {MIN_KICKOFF_MARGIN_MINUTES} minutes du coup d'envoi "
-            "sont volontairement exclus."
-        )
-        return
-
-    candidates = fixtures[:MAX_ANALYSIS_CANDIDATES]
+    candidates = fixtures[:MAX_CANDIDATES]
     picks = []
-
     for fixture in candidates:
-        result = await analyze_fixture(sport_key, fixture)
-        if result:
-            picks.append(result)
-
-    # Une seule sélection par compétition pour éviter de concentrer les choix.
-    picks.sort(key=lambda item: item.get("quality_rank", 0), reverse=True)
-    selected = []
-    used_leagues = set()
-
+        pick = await analyze(sport, fixture)
+        if pick: picks.append(pick)
+    picks.sort(key=lambda x: x["quality_rank"], reverse=True)
+    selected, leagues = [], set()
     for pick in picks:
-        league_key = str(pick.get("league") or "").lower()
-        if league_key in used_leagues:
-            continue
+        league = pick["league"].lower()
+        if league in leagues: continue
         selected.append(pick)
-        used_leagues.add(league_key)
-        if len(selected) >= MAX_PICKS_PER_SPORT:
-            break
+        leagues.add(league)
+        if len(selected) >= MAX_PICKS_PER_SPORT: break
+    for pick in selected:
+        try: await asyncio.to_thread(save_pick, pick)
+        except Exception as exc: log.error("Sauvegarde impossible : %s", exc)
 
-    record_picks(selected)
-
-    lines = [
-        f"👑 ALEPH BET AI {VERSION}",
-        SPORTS[sport_key]["label"],
-        f"🕒 Vérification : {now_local():%d/%m/%Y %H:%M} (Côte d'Ivoire)",
-        f"🔎 Matchs examinés : {len(candidates)}",
-        "",
-    ]
-
+    lines = [f"👑 ALEPH BET AI {VERSION}", SPORTS[sport]["label"],
+             f"🕒 {now_local():%d/%m/%Y %H:%M} (Côte d'Ivoire)",
+             f"🔎 Matchs examinés : {len(candidates)}", ""]
     if not selected:
-        lines += [
-            "📭 Aucune sélection ne franchit les filtres aujourd'hui.",
-            "Le bot préfère ne rien proposer plutôt que forcer un pronostic.",
-        ]
+        lines += ["📭 Aucune sélection ne franchit les filtres.",
+                  "Le bot préfère ne rien proposer plutôt que forcer un pronostic."]
     else:
-        for index, pick in enumerate(selected, start=1):
-            lines += [
-                f"{index}. {pick['home']} — {pick['away']}",
-                f"🏆 {pick['league']}",
-                f"🗓 {format_datetime(pick['start_time'])}",
-                f"🎯 Marché : {pick['market']}",
-                f"📌 Sélection : {pick['selection']}",
-                f"🧭 Indice de cohérence interne : {pick['internal_score']}/100",
-                f"📝 {pick['reason']}",
-                "",
-            ]
-
-    if partial:
-        lines.append(
-            "ℹ️ Couverture partielle : l'API signale d'autres pages ou une liste incomplète."
-        )
-
-    lines += [
-        "",
-        "⚠️ L'indice interne n'est pas une probabilité ni un taux de réussite.",
-        "Le plan gratuit ne fournit pas les cotes. Aucun pari n'est sûr : reste prudent.",
-    ]
-
-    await message.reply_text("\n".join(lines))
+        for i, p in enumerate(selected, 1):
+            lines += [f"{i}. {p['home']} — {p['away']}", f"🏆 {p['league']}",
+                      f"🗓 {fmt_dt(p['start_time'])}", f"🎯 {p['market']}",
+                      f"📌 Sélection : {p['selection']}",
+                      f"🧭 Indice interne : {p['internal_score']}/100",
+                      f"📝 {p['reason']}", ""]
+    if partial: lines.append("ℹ️ Couverture partielle : certaines pages n'ont pas été parcourues.")
+    lines += ["", "⚠️ L'indice interne n'est pas une probabilité. Aucun pari n'est garanti."]
+    await reply(update, "\n".join(lines))
 
 
-async def foot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await analysis_command(update, "football")
+async def foot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await analyze_cmd(update, "football")
 
 
-async def basket_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await analysis_command(update, "basketball")
+async def basket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await analyze_cmd(update, "basketball")
 
 
-async def hockey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await analysis_command(update, "hockey")
+async def hockey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await analyze_cmd(update, "hockey")
 
 
-async def matchs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message:
-        return
-
+async def matchs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        fixtures, partial = await get_upcoming_fixtures("football")
+        fixtures, partial = await upcoming("football")
     except Exception as exc:
-        await message.reply_text(
-            f"⚠️ Impossible de récupérer les matchs : {str(exc)[:300]}"
-        )
+        await reply(update, f"⚠️ Impossible de récupérer les matchs : {str(exc)[:300]}")
         return
-
     if not fixtures:
-        await message.reply_text("📭 Aucun match de football admissible trouvé.")
+        await reply(update, "📭 Aucun match de football admissible trouvé.")
         return
-
-    lines = [
-        f"👑 ALEPH BET AI {VERSION} — ⚽ FOOTBALL",
-        f"📅 Vérification : {now_local():%d/%m/%Y %H:%M}",
-        "",
-    ]
-
-    for index, fixture in enumerate(fixtures[:12], start=1):
-        home, away = fixture_names(fixture)
-        lines.append(
-            f"{index}. {home} — {away}\n"
-            f"🏆 {fixture_league(fixture)}\n"
-            f"🗓 {format_datetime(fixture.get('startTime'))}"
-        )
-
-    if partial:
-        lines.append(
-            "\nℹ️ Liste partielle : l'API indique qu'il existe d'autres pages."
-        )
-
-    lines.append(
-        "\nℹ️ Liste de matchs uniquement, sans recommandation de mise."
-    )
-    await message.reply_text("\n\n".join(lines))
+    lines = [f"👑 ALEPH BET AI {VERSION} — ⚽ FOOTBALL", f"📅 {now_local():%d/%m/%Y %H:%M}", ""]
+    for i, f in enumerate(fixtures[:15], 1):
+        home, away = fixture_names(f)
+        lines.append(f"{i}. {home} — {away}\n🏆 {league_name(f)}\n🗓 {fmt_dt(f.get('startTime'))}")
+    if partial: lines.append("ℹ️ Liste partielle : l'API signale d'autres pages.")
+    await reply(update, "\n\n".join(lines))
 
 
-async def bilan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message:
+async def bilan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not API_KEY:
+        await reply(update, "⚠️ DATASPORTS_API_KEY doit être configurée dans Render.")
         return
-
-    if not DATASPORTS_API_KEY:
-        await message.reply_text(
-            "⚠️ Configure DATASPORTS_API_KEY dans Render pour actualiser les résultats."
-        )
-        return
-
-    history = load_history()
+    history = await asyncio.to_thread(load_history)
     if not history:
-        await message.reply_text(
-            "📊 BILAN ALEPH BET AI\n"
-            "Aucune sélection enregistrée pour le moment."
-        )
+        await reply(update, "📊 BILAN ALEPH BET AI\nAucune sélection enregistrée.")
         return
-
-    await update_pending_results(history)
-
-    lines = [
-        f"📊 BILAN ALEPH BET AI {VERSION}",
-        f"🕒 Mis à jour : {now_local():%d/%m/%Y %H:%M}",
-        "",
-    ]
-
-    labels = {
-        "football": "⚽ Football",
-        "basketball": "🏀 Basketball",
-        "hockey": "🏒 Hockey",
-    }
-
-    for sport_key in ("football", "basketball", "hockey"):
-        rows = [
-            item for item in history
-            if isinstance(item, dict) and item.get("sport") == sport_key
-        ]
-        if not rows:
-            continue
-
-        wins = sum(1 for item in rows if item.get("outcome") == "won")
-        losses = sum(1 for item in rows if item.get("outcome") == "lost")
-        voids = sum(1 for item in rows if item.get("outcome") == "void")
-        pending = sum(1 for item in rows if item.get("outcome") == "pending")
-        settled = wins + losses
-        hit_rate = (wins / settled * 100) if settled else None
-
-        rate_text = f"{hit_rate:.1f}%" if hit_rate is not None else "pas encore calculable"
-
-        lines += [
-            labels[sport_key],
-            f"✅ Gagnés : {wins} | ❌ Perdus : {losses}",
-            f"📈 Taux observé : {rate_text}",
-            f"⏳ En attente : {pending} | Annulés : {voids}",
-            "",
-        ]
-
-    lines += [
-        "Le taux observé porte uniquement sur les sélections réglées et enregistrées par le bot.",
-        "⚠️ Sur Render gratuit, cet historique local peut être perdu lors d'un redémarrage ou redéploiement.",
-    ]
-
-    await message.reply_text("\n".join(lines))
+    await refresh_results(history)
+    history = await asyncio.to_thread(load_history)
+    lines = [f"📊 BILAN ALEPH BET AI {VERSION}", f"🕒 Mis à jour : {now_local():%d/%m/%Y %H:%M}", ""]
+    labels = {"football": "⚽ Football", "basketball": "🏀 Basketball", "hockey": "🏒 Hockey"}
+    for sport, label in labels.items():
+        rows = [x for x in history if x.get("sport") == sport]
+        if not rows: continue
+        wins = sum(x.get("outcome") == "won" for x in rows)
+        losses = sum(x.get("outcome") == "lost" for x in rows)
+        voids = sum(x.get("outcome") == "void" for x in rows)
+        pending = sum(x.get("outcome") == "pending" for x in rows)
+        decided = wins + losses
+        rate = f"{wins / decided * 100:.1f}%" if decided else "non calculable"
+        lines += [label, f"✅ Gagnés : {wins} | ❌ Perdus : {losses}",
+                  f"📈 Taux observé : {rate}", f"⏳ En attente : {pending} | Annulés : {voids}", ""]
+    lines.append("Le taux observé concerne uniquement les sélections réglées et enregistrées.")
+    await reply(update, "\n".join(lines))
 
 
-async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message:
-        return
-
-    await message.reply_text(
-        f"👑 ALEPH BET AI {VERSION}\n"
-        "Centre d'analyse multi-sports.\n\n"
-        "⚽ /foot — analyse football\n"
-        "🏀 /basket — analyse basketball\n"
-        "🏒 /hockey — analyse hockey sur glace\n"
-        "📅 /matchs — matchs de football à venir\n"
-        "📊 /bilan — résultats des sélections enregistrées\n"
-        "🔧 /statut — état de DataSportsAPI\n"
-        "📘 /aide — aide\n\n"
-        "Maximum 2 sélections par sport et par analyse. "
-        "Aucune sélection n'est forcée."
-    )
+async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply(update, f"👑 ALEPH BET AI {VERSION}\nCentre multi-sports\n\n⚽ /foot\n🏀 /basket\n🏒 /hockey\n📅 /matchs\n📊 /bilan\n🔧 /statut\n📘 /aide")
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message:
-        return
-
-    await message.reply_text(
-        f"👑 Bienvenue sur ALEPH BET AI {VERSION}\n\n"
-        "Commandes disponibles :\n"
-        "/premium — centre multi-sports\n"
-        "/foot — analyse football\n"
-        "/pronostics — alias football\n"
-        "/matchs — matchs de football à venir\n"
-        "/basket — analyse basketball\n"
-        "/hockey — analyse hockey sur glace\n"
-        "/bilan — bilan des sélections enregistrées\n"
-        "/statut — état de l'API\n"
-        "/aide — aide"
-    )
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply(update, f"👑 Bienvenue sur ALEPH BET AI {VERSION}\n\nCommandes :\n/start — Démarrer\n/aide — Aide\n/premium — Centre multi-sports\n/statut — État API\n/matchs — Matchs football\n/foot et /pronostics — Analyse football\n/basket — Analyse basketball\n/hockey — Analyse hockey\n/bilan — Bilan")
 
 
-async def aide_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message:
-        return
-
-    await message.reply_text(
-        f"📘 AIDE ALEPH BET AI {VERSION}\n\n"
-        "/foot : analyse football.\n"
-        "/pronostics : alias de /foot.\n"
-        "/matchs : liste les matchs de football à venir.\n"
-        "/basket : analyse basketball.\n"
-        "/hockey : analyse hockey sur glace.\n"
-        "/bilan : met à jour et affiche les résultats enregistrés.\n"
-        "/premium : centre multi-sports.\n"
-        "/statut : vérifie la connexion DataSportsAPI.\n\n"
-        f"Les matchs à moins de {MIN_KICKOFF_MARGIN_MINUTES} minutes du début "
-        "sont exclus. Le bot examine la forme récente et le face-à-face "
-        "lorsque ces données existent.\n\n"
-        "L'indice interne n'est pas une probabilité. Le plan gratuit ne fournit "
-        "pas les cotes. Aucun pari n'est garanti."
-    )
+async def aide_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply(update, f"📘 ALEPH BET AI {VERSION}\n/foot ou /pronostics : analyse football\n/matchs : matchs à venir\n/basket : analyse basketball\n/hockey : analyse hockey\n/bilan : résultats enregistrés\n/premium : centre multi-sports\n/statut : vérifie DataSportsAPI\n\nLes matchs à moins de {MIN_KICKOFF_MARGIN_MINUTES} minutes du début sont exclus. L'indice interne n'est pas une probabilité. Aucun pari n'est garanti.")
 
 
-# ------------------------- Démarrage Render / Telegram -------------------------
-
-def main():
+def main() -> None:
     if not TOKEN:
-        raise RuntimeError("Variable TELEGRAM_BOT_TOKEN absente dans Render.")
+        raise RuntimeError("Variable TELEGRAM_BOT_TOKEN (ou BOT_TOKEN) absente dans Render.")
+    if not API_KEY:
+        raise RuntimeError("Variable DATASPORTS_API_KEY absente dans Render.")
     if not WEBHOOK_URL:
         raise RuntimeError("Variable WEBHOOK_URL absente dans Render.")
-    if not DATASPORTS_API_KEY:
-        raise RuntimeError("Variable DATASPORTS_API_KEY absente dans Render.")
 
     app = Application.builder().token(TOKEN).build()
+    for command, callback in [
+        ("start", start_cmd), ("aide", aide_cmd), ("statut", status_cmd),
+        ("premium", premium_cmd), ("foot", foot_cmd), ("pronostics", foot_cmd),
+        ("matchs", matchs_cmd), ("basket", basket_cmd), ("hockey", hockey_cmd),
+        ("bilan", bilan_cmd),
+    ]:
+        app.add_handler(CommandHandler(command, callback))
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("aide", aide_command))
-    app.add_handler(CommandHandler("statut", status_command))
-    app.add_handler(CommandHandler("premium", premium_command))
-    app.add_handler(CommandHandler("foot", foot_command))
-    app.add_handler(CommandHandler("pronostics", foot_command))
-    app.add_handler(CommandHandler("matchs", matchs_command))
-    app.add_handler(CommandHandler("basket", basket_command))
-    app.add_handler(CommandHandler("hockey", hockey_command))
-    app.add_handler(CommandHandler("bilan", bilan_command))
-
-    webhook_args = {
-        "listen": "0.0.0.0",
-        "port": PORT,
-        "url_path": "telegram",
+    kwargs = {
+        "listen": "0.0.0.0", "port": PORT, "url_path": "telegram",
         "webhook_url": WEBHOOK_URL + "/telegram",
         "allowed_updates": Update.ALL_TYPES,
     }
-
     if WEBHOOK_SECRET:
-        webhook_args["secret_token"] = WEBHOOK_SECRET
-
-    log.info("Starting %s", VERSION)
-    app.run_webhook(**webhook_args)
+        kwargs["secret_token"] = WEBHOOK_SECRET
+    log.info("Démarrage %s", VERSION)
+    app.run_webhook(**kwargs)
 
 
 if __name__ == "__main__":
