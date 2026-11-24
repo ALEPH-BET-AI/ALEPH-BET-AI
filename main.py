@@ -84,6 +84,92 @@ def fmt_dt(value: Any) -> str:
     return dt.strftime("%d/%m/%Y à %H:%M") if dt else "Date indisponible"
 
 
+def database_check() -> tuple[bool, str]:
+    """Teste réellement PostgreSQL sans afficher ni divulguer DATABASE_URL."""
+    if not DATABASE_URL:
+        return False, "DATABASE_URL absente : stockage JSON local utilisé."
+    try:
+        import psycopg
+        with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
+            conn.execute("SELECT 1")
+        return True, "Connexion PostgreSQL opérationnelle."
+    except Exception as exc:
+        log.exception("Échec du test PostgreSQL")
+        return False, f"Connexion PostgreSQL impossible : {type(exc).__name__}: {exc}"
+
+
+def load_history() -> list[dict]:
+    if DATABASE_URL:
+        try:
+            import psycopg
+            with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
+                conn.execute("""CREATE TABLE IF NOT EXISTS aleph_picks (
+                    id BIGSERIAL PRIMARY KEY, fixture_id TEXT NOT NULL, sport TEXT NOT NULL,
+                    selection_side TEXT NOT NULL, payload JSONB NOT NULL,
+                    UNIQUE(fixture_id, sport, selection_side))""")
+                rows = conn.execute("SELECT payload FROM aleph_picks ORDER BY id").fetchall()
+                return [row[0] for row in rows]
+        except Exception as exc:
+            log.exception("PostgreSQL indisponible pendant load_history")
+            # Ne surtout pas transformer une panne PostgreSQL en historique vide.
+            raise RuntimeError(
+                f"PostgreSQL indisponible ({type(exc).__name__}) : {exc}"
+            ) from exc
+
+    try:
+        if HISTORY_FILE.exists():
+            content = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            return content if isinstance(content, list) else []
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Historique JSON illisible : %s", exc)
+    return []
+
+
+def save_pick(pick: dict) -> None:
+    if DATABASE_URL:
+        import psycopg
+        with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS aleph_picks (
+                id BIGSERIAL PRIMARY KEY, fixture_id TEXT NOT NULL, sport TEXT NOT NULL,
+                selection_side TEXT NOT NULL, payload JSONB NOT NULL,
+                UNIQUE(fixture_id, sport, selection_side))""")
+            conn.execute("""INSERT INTO aleph_picks (fixture_id,sport,selection_side,payload)
+                VALUES (%s,%s,%s,%s) ON CONFLICT (fixture_id,sport,selection_side) DO NOTHING""",
+                (pick["fixture_id"], pick["sport"], pick["selection_side"], json.dumps(pick)))
+        log.info("Sélection enregistrée dans PostgreSQL : %s / %s",
+                 pick["sport"], pick["fixture_id"])
+        return
+
+    history = load_history()
+    key = (str(pick["fixture_id"]), pick["sport"], pick["selection_side"])
+    if not any((str(x.get("fixture_id")), x.get("sport"), x.get("selection_side")) == key for x in history):
+        history.append(pick)
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = HISTORY_FILE.with_suffix(HISTORY_FILE.suffix + ".tmp")
+        temp.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, HISTORY_FILE)
+        log.info("Sélection enregistrée dans le fichier JSON : %s / %s",
+                 pick["sport"], pick["fixture_id"])
+
+
+def update_pick(pick: dict) -> None:
+    if DATABASE_URL:
+        import psycopg
+        with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
+            conn.execute("""UPDATE aleph_picks SET payload=%s
+                WHERE fixture_id=%s AND sport=%s AND selection_side=%s""",
+                (json.dumps(pick), pick["fixture_id"], pick["sport"], pick["selection_side"]))
+        return
+
+    history = load_history()
+    for i, old in enumerate(history):
+        if (str(old.get("fixture_id")), old.get("sport"), old.get("selection_side")) == (
+            str(pick.get("fixture_id")), pick.get("sport"), pick.get("selection_side")
+        ):
+            history[i] = pick
+    HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 async def api_get(path: str, params: dict | None = None) -> dict:
     global _last_request
     if not API_KEY:
@@ -312,66 +398,6 @@ async def analyze(sport: str, fixture: dict) -> dict | None:
     }
 
 
-def load_history() -> list[dict]:
-    if DATABASE_URL:
-        try:
-            import psycopg
-            with psycopg.connect(DATABASE_URL) as conn:
-                conn.execute("""CREATE TABLE IF NOT EXISTS aleph_picks (
-                    id BIGSERIAL PRIMARY KEY, fixture_id TEXT NOT NULL, sport TEXT NOT NULL,
-                    selection_side TEXT NOT NULL, payload JSONB NOT NULL,
-                    UNIQUE(fixture_id, sport, selection_side))""")
-                rows = conn.execute("SELECT payload FROM aleph_picks ORDER BY id").fetchall()
-                return [row[0] for row in rows]
-        except Exception as exc:
-            log.error("PostgreSQL indisponible : %s", exc)
-            return []
-    try:
-        if HISTORY_FILE.exists():
-            content = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-            return content if isinstance(content, list) else []
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Historique JSON illisible : %s", exc)
-    return []
-
-
-def save_pick(pick: dict) -> None:
-    if DATABASE_URL:
-        import psycopg
-        with psycopg.connect(DATABASE_URL) as conn:
-            conn.execute("""CREATE TABLE IF NOT EXISTS aleph_picks (
-                id BIGSERIAL PRIMARY KEY, fixture_id TEXT NOT NULL, sport TEXT NOT NULL,
-                selection_side TEXT NOT NULL, payload JSONB NOT NULL,
-                UNIQUE(fixture_id, sport, selection_side))""")
-            conn.execute("""INSERT INTO aleph_picks (fixture_id,sport,selection_side,payload)
-                VALUES (%s,%s,%s,%s) ON CONFLICT (fixture_id,sport,selection_side) DO NOTHING""",
-                (pick["fixture_id"], pick["sport"], pick["selection_side"], json.dumps(pick)))
-        return
-    history = load_history()
-    key = (str(pick["fixture_id"]), pick["sport"], pick["selection_side"])
-    if not any((str(x.get("fixture_id")), x.get("sport"), x.get("selection_side")) == key for x in history):
-        history.append(pick)
-        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temp = HISTORY_FILE.with_suffix(HISTORY_FILE.suffix + ".tmp")
-        temp.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temp, HISTORY_FILE)
-
-
-def update_pick(pick: dict) -> None:
-    if DATABASE_URL:
-        import psycopg
-        with psycopg.connect(DATABASE_URL) as conn:
-            conn.execute("""UPDATE aleph_picks SET payload=%s
-                WHERE fixture_id=%s AND sport=%s AND selection_side=%s""",
-                (json.dumps(pick), pick["fixture_id"], pick["sport"], pick["selection_side"]))
-        return
-    history = load_history()
-    for i, old in enumerate(history):
-        if (str(old.get("fixture_id")), old.get("sport"), old.get("selection_side")) == (str(pick.get("fixture_id")), pick.get("sport"), pick.get("selection_side")):
-            history[i] = pick
-    HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def winner(fixture: dict) -> str | None:
     value = fixture.get("winner")
     if value in {"home", "away", "draw"}: return value
@@ -430,9 +456,16 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         payload = await cached_get("/v2/sports")
         sports = data_of(payload, [])
         count = len(sports) if isinstance(sports, list) else "inconnu"
-        await reply(update, f"👑 ALEPH BET AI {VERSION}\n🟢 DataSportsAPI accessible\n📚 Sports renvoyés : {count}\n🔐 Clé conservée côté serveur.")
+        api_line = f"🟢 DataSportsAPI accessible\n📚 Sports renvoyés : {count}"
     except Exception as exc:
-        await reply(update, f"👑 ALEPH BET AI {VERSION}\n🔴 {str(exc)[:300]}")
+        api_line = f"🔴 DataSportsAPI : {str(exc)[:250]}"
+
+    db_ok, db_message = await asyncio.to_thread(database_check)
+    db_line = f"🟢 {db_message}" if db_ok else f"🔴 {db_message}"
+    await reply(
+        update,
+        f"👑 ALEPH BET AI {VERSION}\n{api_line}\n{db_line}\n🔐 Clés conservées côté serveur."
+    )
 
 
 async def analyze_cmd(update: Update, sport: str) -> None:
@@ -454,9 +487,16 @@ async def analyze_cmd(update: Update, sport: str) -> None:
         selected.append(pick)
         leagues.add(league)
         if len(selected) >= MAX_PICKS_PER_SPORT: break
+
+    saved_count = 0
+    save_errors = []
     for pick in selected:
-        try: await asyncio.to_thread(save_pick, pick)
-        except Exception as exc: log.error("Sauvegarde impossible : %s", exc)
+        try:
+            await asyncio.to_thread(save_pick, pick)
+            saved_count += 1
+        except Exception as exc:
+            log.exception("Sauvegarde impossible")
+            save_errors.append(f"{type(exc).__name__}: {exc}")
 
     lines = [f"👑 ALEPH BET AI {VERSION}", SPORTS[sport]["label"],
              f"🕒 {now_local():%d/%m/%Y %H:%M} (Côte d'Ivoire)",
@@ -471,6 +511,14 @@ async def analyze_cmd(update: Update, sport: str) -> None:
                       f"📌 Sélection : {p['selection']}",
                       f"🧭 Indice interne : {p['internal_score']}/100",
                       f"📝 {p['reason']}", ""]
+
+        if saved_count == len(selected):
+            lines.append(f"💾 Enregistrement confirmé : {saved_count} sélection(s).")
+        else:
+            lines.append(f"⚠️ Enregistrement : {saved_count}/{len(selected)} sélection(s).")
+            if save_errors:
+                lines.append(f"Détail : {save_errors[0][:250]}")
+
     if partial: lines.append("ℹ️ Couverture partielle : certaines pages n'ont pas été parcourues.")
     lines += ["", "⚠️ L'indice interne n'est pas une probabilité. Aucun pari n'est garanti."]
     await reply(update, "\n".join(lines))
@@ -509,12 +557,42 @@ async def bilan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not API_KEY:
         await reply(update, "⚠️ DATASPORTS_API_KEY doit être configurée dans Render.")
         return
-    history = await asyncio.to_thread(load_history)
-    if not history:
-        await reply(update, "📊 BILAN ALEPH BET AI\nAucune sélection enregistrée.")
+
+    try:
+        history = await asyncio.to_thread(load_history)
+    except Exception as exc:
+        log.exception("Impossible de charger l'historique pour /bilan")
+        await reply(
+            update,
+            "🚨 ERREUR DE STOCKAGE\n"
+            "Le bot n'arrive pas à lire l'historique PostgreSQL.\n"
+            f"Détail : {type(exc).__name__}: {str(exc)[:350]}\n"
+            "Aucune donnée n'a été déclarée vide ou supprimée."
+        )
         return
+
+    if not history:
+        backend = "PostgreSQL" if DATABASE_URL else "fichier JSON local"
+        await reply(
+            update,
+            f"📊 BILAN ALEPH BET AI {VERSION}\n"
+            f"Aucune sélection enregistrée dans {backend}.\n"
+            "La lecture du stockage a réussi."
+        )
+        return
+
     await refresh_results(history)
-    history = await asyncio.to_thread(load_history)
+    try:
+        history = await asyncio.to_thread(load_history)
+    except Exception as exc:
+        log.exception("Impossible de recharger l'historique après actualisation")
+        await reply(
+            update,
+            "🚨 ERREUR DE STOCKAGE APRÈS ACTUALISATION\n"
+            f"Détail : {type(exc).__name__}: {str(exc)[:350]}"
+        )
+        return
+
     lines = [f"📊 BILAN ALEPH BET AI {VERSION}", f"🕒 Mis à jour : {now_local():%d/%m/%Y %H:%M}", ""]
     labels = {"football": "⚽ Football", "basketball": "🏀 Basketball", "hockey": "🏒 Hockey"}
     for sport, label in labels.items():
@@ -526,8 +604,10 @@ async def bilan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pending = sum(x.get("outcome") == "pending" for x in rows)
         decided = wins + losses
         rate = f"{wins / decided * 100:.1f}%" if decided else "non calculable"
-        lines += [label, f"✅ Gagnés : {wins} | ❌ Perdus : {losses}",
+        lines += [label, f"📚 Sélections enregistrées : {len(rows)}",
+                  f"✅ Gagnés : {wins} | ❌ Perdus : {losses}",
                   f"📈 Taux observé : {rate}", f"⏳ En attente : {pending} | Annulés : {voids}", ""]
+
     lines.append("Le taux observé concerne uniquement les sélections réglées et enregistrées.")
     await reply(update, "\n".join(lines))
 
@@ -537,11 +617,11 @@ async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply(update, f"👑 Bienvenue sur ALEPH BET AI {VERSION}\n\nCommandes :\n/start — Démarrer\n/aide — Aide\n/premium — Centre multi-sports\n/statut — État API\n/matchs — Matchs football\n/foot et /pronostics — Analyse football\n/basket — Analyse basketball\n/hockey — Analyse hockey\n/bilan — Bilan")
+    await reply(update, f"👑 Bienvenue sur ALEPH BET AI {VERSION}\n\nCommandes :\n/start — Démarrer\n/aide — Aide\n/premium — Centre multi-sports\n/statut — État API et PostgreSQL\n/matchs — Matchs football\n/foot et /pronostics — Analyse football\n/basket — Analyse basketball\n/hockey — Analyse hockey\n/bilan — Bilan")
 
 
 async def aide_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply(update, f"📘 ALEPH BET AI {VERSION}\n/foot ou /pronostics : analyse football\n/matchs : matchs à venir\n/basket : analyse basketball\n/hockey : analyse hockey\n/bilan : résultats enregistrés\n/premium : centre multi-sports\n/statut : vérifie DataSportsAPI\n\nLes matchs à moins de {MIN_KICKOFF_MARGIN_MINUTES} minutes du début sont exclus. L'indice interne n'est pas une probabilité. Aucun pari n'est garanti.")
+    await reply(update, f"📘 ALEPH BET AI {VERSION}\n/foot ou /pronostics : analyse football\n/matchs : matchs à venir\n/basket : analyse basketball\n/hockey : analyse hockey\n/bilan : résultats enregistrés\n/premium : centre multi-sports\n/statut : vérifie DataSportsAPI et PostgreSQL\n\nLes matchs à moins de {MIN_KICKOFF_MARGIN_MINUTES} minutes du début sont exclus. L'indice interne n'est pas une probabilité. Aucun pari n'est garanti.")
 
 
 def main() -> None:
