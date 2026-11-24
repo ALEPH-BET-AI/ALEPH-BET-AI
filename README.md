@@ -1,52 +1,37 @@
-👑 ALEPH BET AI 5.1
+# 👑 ALEPH BET AI 5.1
 
-Bot Telegram intelligent de pronostics sportifs multi-sports
+Bot Telegram de pronostics sportifs multi-sports : football, basketball et hockey sur glace.
 
-ALEPH BET AI analyse les rencontres de :
+## Commandes
+- `/start` — Démarrer
+- `/aide` — Aide
+- `/premium` — Centre multi-sports
+- `/statut` — État de DataSportsAPI
+- `/matchs` — Matchs de football à venir
+- `/foot` ou `/pronostics` — Analyse football
+- `/basket` — Analyse basketball
+- `/hockey` — Analyse hockey
+- `/bilan` — Bilan des sélections enregistrées
 
-* ⚽ Football
-* 🏀 Basketball
-* 🏒 Hockey sur glace
+## Fichiers
+- `main.py` — application Telegram
+- `requirements.txt` — dépendances Python
 
-Fonctionnalités
+## Variables Render
+- `TELEGRAM_BOT_TOKEN` (ou `BOT_TOKEN`)
+- `DATASPORTS_API_KEY`
+- `WEBHOOK_URL`
+- `WEBHOOK_SECRET` (facultatif)
+- `PORT` (Render le fournit généralement)
+- `DATABASE_URL` (facultatif, PostgreSQL)
 
-* Analyse des rencontres à venir
-* Consultation des matchs disponibles
-* Analyses basées sur les données sportives accessibles
-* Historique des pronostics
-* Bilan des pronostics
-* Stockage PostgreSQL si DATABASE_URL est configuré
-* Stockage JSON en solution de secours
+## Déploiement
+Build command : `pip install -r requirements.txt`
+Start command : `python main.py`
 
-Commandes Telegram
+## Stockage
+Avec `DATABASE_URL`, l'historique utilise PostgreSQL et nécessite `psycopg`.
+Sans `DATABASE_URL`, l'historique est conservé dans un fichier JSON local. Sur un hébergement éphémère, ce fichier peut être perdu au redémarrage ou au redéploiement.
 
-* /start — Démarrer le bot
-* /aide — Afficher les commandes
-* /premium — Centre multi-sports
-* /statut — Vérifier le fonctionnement
-* /matchs — Voir les rencontres
-* /foot — Analyses football
-* /pronostics — Pronostics football
-* /basket — Analyses basketball
-* /hockey — Analyses hockey
-* /bilan — Consulter le bilan
-
-Configuration
-
-Variables d’environnement nécessaires :
-
-* BOT_TOKEN
-* DATASPORTS_API_KEY
-* DATABASE_URL (facultatif)
-* PORT
-
-Installation
-
-pip install -r requirements.txt
-python main.py
-
-Important
-
-Les scores affichés sont des indicateurs heuristiques et ne constituent pas des probabilités garanties. Les pronostics sportifs comportent des risques.
-
-ALEPH BET AI — Built for the next level.
+## Limites
+Les indices sont heuristiques, pas des probabilités. Les données de forme et les champs de résultats doivent correspondre au schéma effectivement renvoyé par le compte DataSportsAPI. Le code doit être testé en conditions réelles avant toute utilisation. Aucun pari n'est garanti.
